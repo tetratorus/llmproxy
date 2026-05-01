@@ -1,0 +1,20 @@
+{
+  "name": "llmproxy",
+  "version": "0.1.0",
+  "description": "Namespaced multi-provider LLM observability proxy with request capture.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "node test.js",
+    "test:claude": "node test.js claude",
+    "test:deepseek": "node test.js deepseek",
+    "test:models": "node test.js models"
+  },
+  "keywords": ["llm", "proxy", "anthropic", "deepseek", "observability"],
+  "license": "ISC",
+  "dependencies": {
+    "better-sqlite3": "^12.4.1",
+    "express": "^5.1.0"
+  }
+}

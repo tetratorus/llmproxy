@@ -1,0 +1,1371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Claude Request Explorer</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    :root {
+      --bg-primary: #ffffff;
+      --bg-secondary: #f7f7f8;
+      --bg-hover: #ebebeb;
+      --text-primary: #2e2e2e;
+      --text-secondary: #686868;
+      --border: #d9d9d9;
+      --accent: #cc785c;
+      --user-msg: #f4f4f4;
+      --assistant-msg: #ffffff;
+      --code-bg: #f5f5f5;
+      --shadow: rgba(0, 0, 0, 0.1);
+    }
+
+    body.dark-mode {
+      --bg-primary: #1a1a1a;
+      --bg-secondary: #2d2d2d;
+      --bg-hover: #3a3a3a;
+      --text-primary: #e8e8e8;
+      --text-secondary: #a8a8a8;
+      --border: #404040;
+      --accent: #cc785c;
+      --user-msg: #2d2d2d;
+      --assistant-msg: #252525;
+      --code-bg: #1e1e1e;
+      --shadow: rgba(0, 0, 0, 0.3);
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.6;
+    }
+
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 30px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    h1 {
+      font-size: 28px;
+      font-weight: 600;
+    }
+
+    .header-controls {
+      display: flex;
+      gap: 15px;
+      align-items: center;
+    }
+
+    button {
+      padding: 8px 16px;
+      border: 1px solid var(--border);
+      background: var(--bg-secondary);
+      color: var(--text-primary);
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+      transition: all 0.2s;
+    }
+
+    button:hover {
+      background: var(--bg-hover);
+    }
+
+    button:active {
+      transform: scale(0.98);
+    }
+
+    .request-list {
+      display: grid;
+      gap: 12px;
+    }
+
+    .conversation-group {
+      margin-bottom: 12px;
+    }
+
+    .conversation-children {
+      margin-top: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .request-item {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      transition: all 0.2s;
+    }
+
+    .view-details-btn:hover {
+      opacity: 0.9;
+    }
+
+    .request-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: start;
+      margin-bottom: 8px;
+    }
+
+    .request-meta {
+      display: flex;
+      gap: 12px;
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+
+    .request-meta span {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .status-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    .status-200 {
+      background: #d4edda;
+      color: #155724;
+    }
+
+    body.dark-mode .status-200 {
+      background: #1e4620;
+      color: #7de896;
+    }
+
+    .status-error {
+      background: #f8d7da;
+      color: #721c24;
+    }
+
+    body.dark-mode .status-error {
+      background: #4a1f1f;
+      color: #f8b4b4;
+    }
+
+    .request-preview {
+      font-size: 14px;
+      color: var(--text-secondary);
+      margin-top: 8px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .model-badge {
+      background: var(--accent);
+      color: white;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    .detail-view {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 24px;
+      margin-top: 20px;
+    }
+
+    .detail-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 24px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .back-button {
+      background: var(--bg-primary);
+    }
+
+    .messages {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 20px;
+    }
+
+    .message {
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+    }
+
+    .message.user {
+      background: var(--user-msg);
+    }
+
+    .message.assistant {
+      background: var(--assistant-msg);
+    }
+
+    .message-role {
+      font-weight: 600;
+      font-size: 13px;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 8px;
+      cursor: pointer;
+      user-select: none;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .message-role:hover {
+      opacity: 0.8;
+    }
+
+    .toggle-icon {
+      font-size: 16px;
+      transition: transform 0.2s;
+    }
+
+    .toggle-icon.collapsed {
+      transform: rotate(-90deg);
+    }
+
+    .message-content {
+      white-space: normal;
+      word-wrap: break-word;
+    }
+
+    .message-content.collapsed {
+      display: none;
+    }
+
+    .message-preview {
+      color: var(--text-secondary);
+      font-size: 13px;
+      margin-top: 8px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .metadata-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+
+    .metadata-item {
+      padding: 12px;
+      background: var(--bg-primary);
+      border-radius: 6px;
+      border: 1px solid var(--border);
+    }
+
+    .metadata-label {
+      font-size: 12px;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      margin-bottom: 4px;
+    }
+
+    .metadata-value {
+      font-size: 16px;
+      font-weight: 500;
+    }
+
+    .pagination {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 12px;
+      margin-top: 30px;
+      padding-top: 20px;
+      border-top: 1px solid var(--border);
+    }
+
+    .page-info {
+      font-size: 14px;
+      color: var(--text-secondary);
+    }
+
+    .loading {
+      text-align: center;
+      padding: 40px;
+      color: var(--text-secondary);
+    }
+
+    .empty {
+      text-align: center;
+      padding: 60px 20px;
+      color: var(--text-secondary);
+    }
+
+    .empty h2 {
+      margin-bottom: 8px;
+    }
+
+    code {
+      background: var(--code-bg);
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+      font-size: 13px;
+    }
+
+    pre {
+      background: var(--code-bg);
+      padding: 0;
+      border-radius: 0;
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      margin: 0;
+    }
+
+    pre code {
+      background: none;
+      padding: 0;
+    }
+
+    .tool-use {
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      border-radius: 0;
+      padding: 0;
+      margin: 0;
+    }
+
+    .tool-name {
+      font-weight: 600;
+      color: var(--accent);
+      margin: 0;
+      padding: 0;
+    }
+
+    .copy-button {
+      float: right;
+      padding: 4px 8px;
+      font-size: 12px;
+    }
+
+    .search-bar {
+      display: flex;
+      align-items: center;
+      padding: 12px;
+      background: var(--bg-primary);
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      margin-bottom: 12px;
+    }
+
+    .stats-bar {
+      display: flex;
+      gap: 20px;
+      padding: 12px;
+      background: var(--bg-primary);
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      margin-bottom: 20px;
+      font-size: 14px;
+    }
+
+    .stats-bar strong {
+      color: var(--accent);
+    }
+
+    .conversation-nav {
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 16px;
+      margin-bottom: 20px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-size: 14px;
+    }
+
+    .conversation-nav .nav-label {
+      color: var(--text-secondary);
+      font-weight: 500;
+      margin-right: 8px;
+    }
+
+    .conversation-nav .nav-link {
+      padding: 4px 10px;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      cursor: pointer;
+      transition: all 0.2s;
+      color: var(--text-primary);
+      text-decoration: none;
+      display: inline-block;
+    }
+
+    .conversation-nav .nav-link:hover {
+      background: var(--bg-hover);
+      border-color: var(--accent);
+    }
+
+    .conversation-nav .nav-link.current {
+      background: var(--accent);
+      color: white;
+      border-color: var(--accent);
+      font-weight: 600;
+      cursor: default;
+    }
+
+    .conversation-nav .nav-link.load-more {
+      background: var(--bg-primary);
+      color: var(--text-secondary);
+      font-style: italic;
+    }
+
+    .conversation-nav .nav-separator {
+      color: var(--text-secondary);
+      margin: 0 4px;
+    }
+
+    @media (max-width: 768px) {
+      .message.user {
+        margin-left: 20px;
+      }
+
+      .message.assistant {
+        margin-right: 20px;
+      }
+
+      .metadata-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+
+  <!-- Alpine.js -->
+  <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
+</head>
+<body x-data="appState" x-init="init()">
+  <div class="container">
+    <header>
+      <h1>Claude Request Explorer</h1>
+      <div class="header-controls">
+        <button @click="toggleDarkMode()">🌓 Dark Mode</button>
+        <button @click="loadRequests(currentPage)">🔄 Refresh</button>
+      </div>
+    </header>
+
+    <div id="app">
+      <div class="loading">Loading requests...</div>
+    </div>
+  </div>
+
+  <script>
+    // Global reference to Alpine state
+    let app = null;
+
+    // Alpine.js app state
+    document.addEventListener('alpine:init', () => {
+      Alpine.data('appState', () => ({
+        // State
+        currentPage: 1,
+        totalPages: 1,
+        totalRequests: 0,
+        currentView: 'list',
+        selectedRequest: null,
+        currentSearch: '',
+
+        // Initialize
+        init() {
+          app = this;
+
+          // Check for dark mode preference
+          if (localStorage.getItem('darkMode') === 'true') {
+            document.body.classList.add('dark-mode');
+          }
+
+          // Handle browser back/forward buttons
+          window.addEventListener('popstate', (event) => {
+            if (event.state) {
+              if (event.state.view === 'detail') {
+                loadRequest(event.state.id, event.state.search || '', true, event.state.expanded || []);
+              } else if (event.state.view === 'list') {
+                this.loadRequests(event.state.page || 1, event.state.search || '', true);
+              }
+            } else {
+              // No state means we're at the initial page
+              this.loadRequests(1, '', true);
+            }
+          });
+
+          // Check URL for initial state
+          const urlParams = new URLSearchParams(window.location.search);
+          const view = urlParams.get('view');
+          const id = urlParams.get('id');
+          const page = parseInt(urlParams.get('page')) || 1;
+          const search = urlParams.get('search') || '';
+
+          if (view === 'detail' && id) {
+            const expanded = urlParams.get('expanded') ? urlParams.get('expanded').split(',') : [];
+            loadRequest(id, search, true, expanded);
+            // Set initial history state
+            const url = new URL(window.location);
+            history.replaceState({ view: 'detail', id, search, expanded }, '', url);
+          } else {
+            this.loadRequests(page, search, true);
+            // Set initial history state with proper URL
+            const url = new URL(window.location);
+            url.searchParams.set('view', 'list');
+            url.searchParams.set('page', page);
+            if (search) {
+              url.searchParams.set('search', search);
+            } else {
+              url.searchParams.delete('search');
+            }
+            history.replaceState({ view: 'list', page, search }, '', url);
+          }
+        },
+
+        // Toggle dark mode
+        toggleDarkMode() {
+          document.body.classList.toggle('dark-mode');
+          localStorage.setItem('darkMode', document.body.classList.contains('dark-mode'));
+        },
+
+        // Load requests from API
+        async loadRequests(page = 1, search = null, skipHistory = false) {
+          try {
+            const searchQuery = search !== null ? search : this.currentSearch;
+            const searchParam = searchQuery ? `&search=${encodeURIComponent(searchQuery)}` : '';
+            const response = await fetch(`/api/requests?page=${page}&limit=20${searchParam}`);
+            const data = await response.json();
+
+            this.currentPage = page;
+            this.totalPages = data.totalPages;
+            this.totalRequests = data.total;
+            this.currentSearch = searchQuery;
+            this.currentView = 'list';
+
+            // Update URL and history
+            if (!skipHistory) {
+              const url = new URL(window.location);
+              url.searchParams.set('view', 'list');
+              url.searchParams.set('page', page);
+              if (searchQuery) {
+                url.searchParams.set('search', searchQuery);
+              } else {
+                url.searchParams.delete('search');
+              }
+              history.pushState({ view: 'list', page, search: searchQuery }, '', url);
+            }
+
+            renderRequestList(data.requests);
+          } catch (error) {
+            console.error('Error loading requests:', error);
+            document.getElementById('app').innerHTML = `
+              <div class="empty">
+                <h2>Error loading requests</h2>
+                <p>${error.message}</p>
+              </div>
+            `;
+          }
+        }
+      }));
+    });
+
+    // Load specific request
+    async function loadRequest(id, searchTerm = '', skipHistory = false, expandedMessages = []) {
+      try {
+        const response = await fetch(`/api/requests/${id}`);
+        const data = await response.json();
+        app.selectedRequest = data;
+        app.currentView = 'detail';
+
+        // Update URL and history
+        if (!skipHistory) {
+          const url = new URL(window.location);
+          url.searchParams.set('view', 'detail');
+          url.searchParams.set('id', id);
+          if (searchTerm) {
+            url.searchParams.set('search', searchTerm);
+          } else {
+            url.searchParams.delete('search');
+          }
+          if (expandedMessages.length > 0) {
+            url.searchParams.set('expanded', expandedMessages.join(','));
+          } else {
+            url.searchParams.delete('expanded');
+          }
+          url.searchParams.delete('page'); // Remove page param when viewing detail
+          history.pushState({ view: 'detail', id, search: searchTerm, expanded: expandedMessages }, '', url);
+        }
+
+        renderDetailView(data, searchTerm, expandedMessages);
+      } catch (error) {
+        console.error('Error loading request:', error);
+        alert('Failed to load request details');
+      }
+    }
+
+    // Load more previous history
+    async function loadMorePreviousHistory(requestId, currentNav) {
+      try {
+        const offset = currentNav.prev_10.length;
+        const response = await fetch(`/api/requests/${requestId}/history?offset=${offset}&limit=10`);
+        const data = await response.json();
+
+        if (data.prev_requests && data.prev_requests.length > 0) {
+          // Update the navigation in the selected request
+          app.selectedRequest.navigation.prev_10 = [...data.prev_requests, ...app.selectedRequest.navigation.prev_10];
+          app.selectedRequest.navigation.has_more_prev = data.has_more;
+
+          // Re-render the detail view with updated navigation
+          renderDetailView(app.selectedRequest);
+        } else {
+          alert('No more previous history found');
+        }
+      } catch (error) {
+        console.error('Error loading more history:', error);
+        alert('Failed to load more history');
+      }
+    }
+
+    // Render request list
+    function renderRequestList(requests) {
+      if (requests.length === 0) {
+        document.getElementById('app').innerHTML = `
+          <div class="search-bar">
+            <input type="text" id="searchInput" placeholder="Search messages..." value="${app.currentSearch}" title="FTS5 Search: Use &quot;exact phrase&quot;, whisper*, AND, OR, NOT operators" style="padding: 8px 12px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-secondary); color: var(--text-primary); font-size: 14px; width: 300px;">
+            <button id="searchBtn" style="padding: 8px 16px; background: var(--accent); color: white; border: none; border-radius: 4px; cursor: pointer; margin-left: 8px;">Search</button>
+            ${app.currentSearch ? `<button id="clearBtn" style="padding: 8px 16px; background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; margin-left: 8px;">Clear</button>` : ''}
+          </div>
+          <div class="stats-bar">
+            <span>${app.currentSearch ? `No results for "${app.currentSearch}"` : 'No requests yet'}</span>
+          </div>
+          <div class="empty">
+            <h2>${app.currentSearch ? 'No matching requests found' : 'No requests yet'}</h2>
+            <p>${app.currentSearch ? 'Try a different search term' : 'Requests will appear here once you start using the proxy.'}</p>
+          </div>
+        `;
+
+        // Add search listeners for empty state
+        const searchBtn = document.getElementById('searchBtn');
+        const searchInput = document.getElementById('searchInput');
+        const clearBtn = document.getElementById('clearBtn');
+
+        if (searchBtn) {
+          searchBtn.addEventListener('click', () => {
+            const search = searchInput.value.trim();
+            app.loadRequests(1, search);
+          });
+        }
+
+        if (searchInput) {
+          searchInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+              const search = searchInput.value.trim();
+              app.loadRequests(1, search);
+            }
+          });
+        }
+
+        if (clearBtn) {
+          clearBtn.addEventListener('click', () => {
+            app.loadRequests(1, '');
+          });
+        }
+
+        return;
+      }
+
+      // Group requests by session_id (conversation)
+      const conversations = {};
+      requests.forEach(req => {
+        const sessionId = req.session_id || `single-${req.id}`;
+        if (!conversations[sessionId]) {
+          conversations[sessionId] = [];
+        }
+        conversations[sessionId].push(req);
+      });
+
+      // For each conversation, sort by message count (descending) to identify parent
+      Object.values(conversations).forEach(convReqs => {
+        convReqs.sort((a, b) => (b.message_count || 0) - (a.message_count || 0));
+      });
+
+      // Render conversations in order of latest request
+      const conversationHtml = requests
+        .filter(req => {
+          const sessionId = req.session_id || `single-${req.id}`;
+          const convReqs = conversations[sessionId];
+          // Only render if this is the parent (first in sorted list)
+          return convReqs[0].id === req.id;
+        })
+        .map(parentReq => {
+          const sessionId = parentReq.session_id || `single-${parentReq.id}`;
+          const convReqs = conversations[sessionId];
+          const children = convReqs.slice(1); // All except parent
+
+          return renderConversationGroup(parentReq, children);
+        })
+        .join('');
+
+      const html = `
+        <div class="search-bar">
+          <input type="text" id="searchInput" placeholder="Search messages..." value="${app.currentSearch}" title="FTS5 Search: Use &quot;exact phrase&quot;, whisper*, AND, OR, NOT operators" style="padding: 8px 12px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-secondary); color: var(--text-primary); font-size: 14px; width: 300px;">
+          <button id="searchBtn" style="padding: 8px 16px; background: var(--accent); color: white; border: none; border-radius: 4px; cursor: pointer; margin-left: 8px;">Search</button>
+          ${app.currentSearch ? `<button id="clearBtn" style="padding: 8px 16px; background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; margin-left: 8px;">Clear</button>` : ''}
+        </div>
+        <div class="stats-bar">
+          <span><strong>${app.totalRequests}</strong> ${app.currentSearch ? `result${app.totalRequests !== 1 ? 's' : ''} for "${app.currentSearch}"` : 'total requests'}</span>
+        </div>
+        <div class="request-list">
+          ${conversationHtml}
+        </div>
+        ${renderPagination()}
+      `;
+
+      document.getElementById('app').innerHTML = html;
+
+      // Add click listeners only to the "View" buttons
+      requests.forEach(req => {
+        const btn = document.getElementById(`view-${req.id}`);
+        if (btn) {
+          btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            loadRequest(req.id, app.currentSearch);
+          });
+        }
+      });
+
+      // Add pagination listeners
+      if (app.currentPage > 1) {
+        document.getElementById('prevPage').addEventListener('click', () => app.loadRequests(app.currentPage - 1));
+      }
+      if (app.currentPage < app.totalPages) {
+        document.getElementById('nextPage').addEventListener('click', () => app.loadRequests(app.currentPage + 1));
+      }
+
+      // Add search listeners
+      const searchBtn = document.getElementById('searchBtn');
+      const searchInput = document.getElementById('searchInput');
+      const clearBtn = document.getElementById('clearBtn');
+
+      if (searchBtn) {
+        searchBtn.addEventListener('click', () => {
+          const search = searchInput.value.trim();
+          app.loadRequests(1, search);
+        });
+      }
+
+      if (searchInput) {
+        searchInput.addEventListener('keypress', (e) => {
+          if (e.key === 'Enter') {
+            const search = searchInput.value.trim();
+            app.loadRequests(1, search);
+          }
+        });
+      }
+
+      if (clearBtn) {
+        clearBtn.addEventListener('click', () => {
+          app.loadRequests(1, '');
+        });
+      }
+    }
+
+    // Render conversation group (parent + children)
+    function renderConversationGroup(parent, children) {
+      const sessionId = parent.session_id || `single-${parent.id}`;
+      const childrenId = `children-${sessionId}`;
+      const hasChildren = children.length > 0;
+
+      return `
+        <div class="conversation-group">
+          ${renderRequestItem(parent, false, childrenId, hasChildren)}
+          <div id="${childrenId}" class="conversation-children">
+            ${children.map(child => renderRequestItem(child, true)).join('')}
+          </div>
+        </div>
+      `;
+    }
+
+    // Render single request item
+    function renderRequestItem(req, isChild = false, childrenId = null, hasChildren = false) {
+      const timestamp = new Date(req.timestamp).toLocaleString();
+      const statusClass = req.status_code === 200 ? 'status-200' : 'status-error';
+
+      // Get message count from API response
+      const messageCount = req.message_count || 0;
+      const turns = Math.floor(messageCount / 2); // Approximate turns (user + assistant = 1 turn)
+
+      // Extract first user message for preview
+      let preview = '';
+      if (req.body && req.body.messages && req.body.messages.length > 0) {
+        const firstMsg = req.body.messages.find(m => m.role === 'user');
+        if (firstMsg && firstMsg.content) {
+          if (typeof firstMsg.content === 'string') {
+            preview = firstMsg.content.substring(0, 150);
+          } else if (Array.isArray(firstMsg.content)) {
+            const textContent = firstMsg.content.find(c => c.type === 'text');
+            if (textContent) {
+              preview = textContent.text.substring(0, 150);
+            }
+          }
+        }
+      }
+
+      const contentId = `content-${req.id}`;
+      const indentStyle = isChild ? 'margin-left: 32px; border-left: 2px solid var(--border); padding-left: 12px;' : '';
+
+      return `
+        <div class="request-item" id="req-${req.id}" style="${indentStyle}">
+          <div class="request-header">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              ${!isChild && hasChildren ? `<span class="toggle-icon" id="icon-${childrenId}" style="cursor: pointer; font-size: 14px; user-select: none;" onclick="event.stopPropagation(); toggleConversation('${childrenId}')">▼</span>` : ''}
+              <span class="model-badge">${req.model || req.original_model || 'unknown'}</span>
+              <span class="status-badge ${statusClass}">${req.status_code || 'pending'}</span>
+              ${messageCount > 0 ? `<span class="status-badge" style="background: var(--bg-primary); color: var(--text-primary); border: 1px solid var(--border);">💬 ${messageCount} msg${messageCount !== 1 ? 's' : ''} (${turns} turn${turns !== 1 ? 's' : ''})</span>` : ''}
+              ${req.match_count > 0 ? `<span class="status-badge" style="background: var(--accent); color: white; border: 1px solid var(--accent);">🔍 ${req.match_count} match${req.match_count !== 1 ? 'es' : ''}</span>` : ''}
+            </div>
+            <div class="request-meta">
+              <span>⏱️ ${req.response_time || 0}ms</span>
+              <span>🔤 ${(req.input_tokens || 0).toLocaleString()} / ${(req.output_tokens || 0).toLocaleString()}</span>
+              <button class="view-details-btn" id="view-${req.id}" style="margin-left: 8px; padding: 4px 12px; background: var(--accent); color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 12px;">View</button>
+            </div>
+          </div>
+          <div id="${contentId}" class="item-collapsible-content">
+            <div style="font-size: 13px; color: var(--text-secondary); margin-bottom: 4px;">${timestamp}</div>
+            ${preview ? `<div class="request-preview">${preview}...</div>` : ''}
+          </div>
+        </div>
+      `;
+    }
+
+    // Render pagination
+    function renderPagination() {
+      if (app.totalPages <= 1) return '';
+
+      return `
+        <div class="pagination">
+          <button id="prevPage" ${app.currentPage === 1 ? 'disabled' : ''}>← Previous</button>
+          <span class="page-info">Page ${app.currentPage} of ${app.totalPages}</span>
+          <button id="nextPage" ${app.currentPage === app.totalPages ? 'disabled' : ''}>Next →</button>
+        </div>
+      `;
+    }
+
+    // Track currently expanded messages
+    let currentExpandedMessages = [];
+
+    // Render detail view
+    function renderDetailView(req, searchTerm = '', expandedMessages = []) {
+      currentExpandedMessages = [...expandedMessages];
+      const timestamp = new Date(req.timestamp).toLocaleString();
+
+      // Find all messages containing search term if searching
+      let searchMatches = [];
+      if (searchTerm && req.body && req.body.messages) {
+        const searchLower = searchTerm.toLowerCase();
+        req.body.messages.forEach((msg, index) => {
+          if (msg.content) {
+            const contentStr = typeof msg.content === 'string'
+              ? msg.content
+              : JSON.stringify(msg.content);
+            if (contentStr.toLowerCase().includes(searchLower)) {
+              searchMatches.push(index);
+            }
+          }
+        });
+      }
+
+      let html = `
+        <div class="detail-header">
+          <h2>Request Details</h2>
+          <button class="back-button" id="backButton">← Back to List</button>
+        </div>
+
+        <div class="metadata-grid">
+          <div class="metadata-item">
+            <div class="metadata-label">Timestamp</div>
+            <div class="metadata-value">${timestamp}</div>
+          </div>
+          <div class="metadata-item">
+            <div class="metadata-label">Model</div>
+            <div class="metadata-value">${req.model || req.original_model || 'unknown'}</div>
+          </div>
+          <div class="metadata-item">
+            <div class="metadata-label">Status</div>
+            <div class="metadata-value">${req.status_code || 'pending'}</div>
+          </div>
+          <div class="metadata-item">
+            <div class="metadata-label">Response Time</div>
+            <div class="metadata-value">${req.response_time || 0}ms</div>
+          </div>
+          <div class="metadata-item">
+            <div class="metadata-label">Input Tokens</div>
+            <div class="metadata-value">${(req.input_tokens || 0).toLocaleString()}</div>
+          </div>
+          <div class="metadata-item">
+            <div class="metadata-label">Output Tokens</div>
+            <div class="metadata-value">${(req.output_tokens || 0).toLocaleString()}</div>
+          </div>
+        </div>
+      `;
+
+      // Add search match navigation if searching
+      if (searchMatches.length > 0) {
+        html += `
+          <div class="search-match-nav" style="position: sticky; top: 0; z-index: 100; background: var(--bg-primary); border: 1px solid var(--border); border-radius: 6px; padding: 12px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center;">
+            <div style="color: var(--text-secondary);">
+              Searching for: <strong style="color: var(--accent);">"${searchTerm}"</strong> •
+              <span id="matchCounter">Match <strong>1</strong> of <strong>${searchMatches.length}</strong></span>
+            </div>
+            <div style="display: flex; gap: 8px;">
+              <button id="prevMatch" style="padding: 4px 12px; background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 4px; cursor: pointer;">← Prev</button>
+              <button id="nextMatch" style="padding: 4px 12px; background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 4px; cursor: pointer;">Next →</button>
+            </div>
+          </div>
+        `;
+      }
+
+      // Render conversation navigation
+      if (req.navigation) {
+        html += '<div class="conversation-nav">';
+        html += '<span class="nav-label">Conversation:</span>';
+
+        // Show "load more" button for older history
+        if (req.navigation.has_more_prev) {
+          html += '<button class="nav-link load-more" id="loadMorePrev">?</button>';
+          html += '<span class="nav-separator">...</span>';
+        }
+
+        // Show previous 10 requests (reversed to show oldest first)
+        if (req.navigation.prev_10 && req.navigation.prev_10.length > 0) {
+          req.navigation.prev_10.forEach(prev => {
+            html += `<button class="nav-link" data-req-id="${prev.id}">${prev.msg_count}</button>`;
+          });
+        }
+
+        // Show current request
+        html += `<button class="nav-link current">${req.navigation.msg_count}</button>`;
+
+        // Show next requests (could be multiple due to forking)
+        if (req.navigation.next && req.navigation.next.length > 0) {
+          req.navigation.next.forEach(next => {
+            html += `<button class="nav-link" data-req-id="${next.id}">${next.msg_count}</button>`;
+          });
+        }
+
+        html += '</div>';
+      }
+
+      // Render messages
+      if (req.body && req.body.messages) {
+        html += '<h3 style="margin: 24px 0 12px 0;">Request Messages</h3>';
+        html += '<div class="messages">';
+        req.body.messages.forEach((msg, index) => {
+          const msgId = `msg-${index}`;
+          const isExpanded = expandedMessages.includes(msgId);
+          html += renderMessage(msg, index, searchTerm, isExpanded);
+        });
+        html += '</div>';
+      }
+
+      // Render response
+      if (req.response) {
+        html += '<h3 style="margin: 24px 0 12px 0;">Response</h3>';
+
+        // Check if it's a streaming response
+        if (typeof req.response === 'string' && req.response.startsWith('data:')) {
+          html += renderStreamingResponse(req.response, expandedMessages);
+        } else if (req.response.content) {
+          html += '<div class="messages">';
+          const respMsgId = 'msg-999';
+          const isExpanded = expandedMessages.includes(respMsgId);
+          html += renderMessage({ role: 'assistant', content: req.response.content }, 999, '', isExpanded);
+          html += '</div>';
+        } else {
+          html += `<pre><code>${JSON.stringify(req.response, null, 2)}</code></pre>`;
+        }
+      }
+
+      document.getElementById('app').innerHTML = `<div class="detail-view">${html}</div>`;
+
+      // Add back button listener - use browser back button
+      document.getElementById('backButton').addEventListener('click', () => history.back());
+
+      // Add navigation link listeners
+      document.querySelectorAll('.nav-link[data-req-id]').forEach(link => {
+        link.addEventListener('click', () => {
+          const reqId = link.getAttribute('data-req-id');
+          loadRequest(reqId);
+        });
+      });
+
+      // Add load more previous history listener
+      if (req.navigation && req.navigation.has_more_prev) {
+        document.getElementById('loadMorePrev').addEventListener('click', () => {
+          loadMorePreviousHistory(req.id, req.navigation);
+        });
+      }
+
+      // Add search match navigation listeners
+      if (searchMatches.length > 0) {
+        let currentMatchIndex = 0;
+
+        function navigateToMatch(index) {
+          if (index < 0 || index >= searchMatches.length) return;
+          currentMatchIndex = index;
+
+          const messageIndex = searchMatches[currentMatchIndex];
+          const msgId = `msg-${messageIndex}`;
+
+          const content = document.getElementById(`content-${msgId}`);
+          const preview = document.getElementById(`preview-${msgId}`);
+          const icon = document.getElementById(`icon-${msgId}`);
+
+          // Expand the message if collapsed
+          if (content && content.classList.contains('collapsed')) {
+            content.classList.remove('collapsed');
+            if (preview) preview.classList.add('collapsed');
+            if (icon) icon.classList.remove('collapsed');
+
+            // Add to expanded list
+            if (!currentExpandedMessages.includes(msgId)) {
+              currentExpandedMessages.push(msgId);
+            }
+
+            // Update history
+            const url = new URL(window.location);
+            url.searchParams.set('expanded', currentExpandedMessages.join(','));
+            const currentState = history.state || {};
+            history.pushState(
+              {
+                view: 'detail',
+                id: app.selectedRequest.id,
+                search: currentState.search || '',
+                expanded: [...currentExpandedMessages]
+              },
+              '',
+              url
+            );
+          }
+
+          // Scroll to the actual search term highlight
+          const messageEl = content?.parentElement;
+          if (messageEl) {
+            // Find the first highlighted search term (mark element) within this message
+            const markEl = content.querySelector('mark');
+            const scrollTarget = markEl || messageEl;
+
+            scrollTarget.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            // Highlight briefly
+            messageEl.style.transition = 'background 0.15s';
+            messageEl.style.background = 'var(--accent)';
+            messageEl.style.opacity = '0.2';
+            setTimeout(() => {
+              messageEl.style.background = '';
+              messageEl.style.opacity = '';
+            }, 400);
+          }
+
+          // Update counter
+          document.getElementById('matchCounter').innerHTML = `Match <strong>${currentMatchIndex + 1}</strong> of <strong>${searchMatches.length}</strong>`;
+        }
+
+        document.getElementById('prevMatch').addEventListener('click', () => {
+          navigateToMatch(currentMatchIndex - 1);
+        });
+
+        document.getElementById('nextMatch').addEventListener('click', () => {
+          navigateToMatch(currentMatchIndex + 1);
+        });
+
+        // Navigate to first match on load
+        setTimeout(() => navigateToMatch(0), 300);
+      }
+    }
+
+    // Helper function to highlight search term in text
+    function highlightSearchTerm(text, searchTerm) {
+      if (!searchTerm) return text;
+      const escapedSearch = searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const regex = new RegExp(`(${escapedSearch})`, 'gi');
+      return text.replace(regex, '<mark style="background: #ffeb3b; color: #000; padding: 1px 2px; border-radius: 2px; font-weight: 600;">$1</mark>');
+    }
+
+    // Render a single message
+    function renderMessage(msg, index, searchTerm = '', isExpanded = false) {
+      let content = '';
+      let preview = '';
+
+      if (typeof msg.content === 'string') {
+        content = escapeHtml(msg.content);
+        if (searchTerm) content = highlightSearchTerm(content, searchTerm);
+        preview = content.substring(0, 100) + (content.length > 100 ? '...' : '');
+      } else if (Array.isArray(msg.content)) {
+        content = msg.content.map(block => {
+          if (block.type === 'text') {
+            let text = escapeHtml(block.text);
+            if (searchTerm) text = highlightSearchTerm(text, searchTerm);
+            if (!preview) {
+              preview = text.substring(0, 100) + (text.length > 100 ? '...' : '');
+            }
+            return text;
+          } else if (block.type === 'tool_use') {
+            if (!preview) preview = `Tool: ${block.name}`;
+            const toolId = `tool-${Date.now()}-${Math.random()}`;
+            let toolContent = escapeHtml(JSON.stringify(block.input, null, 2));
+            if (searchTerm) toolContent = highlightSearchTerm(toolContent, searchTerm);
+            return `
+              <div class="tool-use">
+                <div class="tool-name" onclick="toggleMessage('${toolId}')" style="cursor: pointer; user-select: none;">
+                  🔧 ${block.name}
+                  <span class="toggle-icon collapsed" id="icon-${toolId}" style="float: right;">▼</span>
+                </div>
+                <div class="message-preview" id="preview-${toolId}">Click to view parameters</div>
+                <pre class="collapsed" id="content-${toolId}"><code>${toolContent}</code></pre>
+              </div>
+            `;
+          } else if (block.type === 'tool_result') {
+            if (!preview) preview = 'Tool Result';
+            const toolId = `tool-result-${Date.now()}-${Math.random()}`;
+            let toolResult = escapeHtml(block.content);
+            if (searchTerm) toolResult = highlightSearchTerm(toolResult, searchTerm);
+            return `
+              <div class="tool-use">
+                <div class="tool-name" onclick="toggleMessage('${toolId}')" style="cursor: pointer; user-select: none;">
+                  📊 Tool Result
+                  <span class="toggle-icon collapsed" id="icon-${toolId}" style="float: right;">▼</span>
+                </div>
+                <div class="message-preview" id="preview-${toolId}">Click to view result</div>
+                <pre class="collapsed" id="content-${toolId}"><code>${toolResult}</code></pre>
+              </div>
+            `;
+          }
+          return '';
+        }).join('');
+      }
+
+      const msgId = `msg-${index}`;
+      const collapsedClass = isExpanded ? '' : 'collapsed';
+      const iconClass = isExpanded ? '' : 'collapsed';
+
+      return `
+        <div class="message ${msg.role}">
+          <div class="message-role" onclick="toggleMessageWithHistory('${msgId}')">
+            <span>${msg.role}</span>
+            <span class="toggle-icon ${iconClass}" id="icon-${msgId}">▼</span>
+          </div>
+          <div class="message-preview ${isExpanded ? 'collapsed' : ''}" id="preview-${msgId}">${preview}</div>
+          <div class="message-content ${collapsedClass}" id="content-${msgId}">${content}</div>
+        </div>
+      `;
+    }
+
+    // Toggle message visibility with history tracking
+    function toggleMessageWithHistory(msgId) {
+      const content = document.getElementById(`content-${msgId}`);
+      const preview = document.getElementById(`preview-${msgId}`);
+      const icon = document.getElementById(`icon-${msgId}`);
+
+      const isCollapsed = content.classList.contains('collapsed');
+
+      if (isCollapsed) {
+        content.classList.remove('collapsed');
+        preview.classList.add('collapsed');
+        icon.classList.remove('collapsed');
+        // Add to expanded list
+        if (!currentExpandedMessages.includes(msgId)) {
+          currentExpandedMessages.push(msgId);
+        }
+      } else {
+        content.classList.add('collapsed');
+        preview.classList.remove('collapsed');
+        icon.classList.add('collapsed');
+        // Remove from expanded list
+        currentExpandedMessages = currentExpandedMessages.filter(id => id !== msgId);
+      }
+
+      // Push new history state
+      const url = new URL(window.location);
+      if (currentExpandedMessages.length > 0) {
+        url.searchParams.set('expanded', currentExpandedMessages.join(','));
+      } else {
+        url.searchParams.delete('expanded');
+      }
+
+      const currentState = history.state || {};
+      history.pushState(
+        {
+          view: 'detail',
+          id: app.selectedRequest.id,
+          search: currentState.search || '',
+          expanded: [...currentExpandedMessages]
+        },
+        '',
+        url
+      );
+    }
+
+    // Toggle message visibility (without history, for tool blocks)
+    function toggleMessage(msgId) {
+      const content = document.getElementById(`content-${msgId}`);
+      const preview = document.getElementById(`preview-${msgId}`);
+      const icon = document.getElementById(`icon-${msgId}`);
+
+      const isCollapsed = content.classList.contains('collapsed');
+
+      if (isCollapsed) {
+        content.classList.remove('collapsed');
+        preview.classList.add('collapsed');
+        icon.classList.remove('collapsed');
+      } else {
+        content.classList.add('collapsed');
+        preview.classList.remove('collapsed');
+        icon.classList.add('collapsed');
+      }
+    }
+
+    // Toggle item content visibility in list view
+    function toggleItemContent(contentId) {
+      const contentEl = document.getElementById(contentId);
+      const icon = document.getElementById(`icon-${contentId}`);
+
+      if (!contentEl || !icon) return;
+
+      if (contentEl.style.display === 'none') {
+        contentEl.style.display = 'block';
+        icon.textContent = '▼';
+      } else {
+        contentEl.style.display = 'none';
+        icon.textContent = '▶';
+      }
+    }
+
+    // Toggle conversation children visibility
+    function toggleConversation(childrenId) {
+      const childrenEl = document.getElementById(childrenId);
+      const icon = document.getElementById(`icon-${childrenId}`);
+
+      if (!childrenEl || !icon) return;
+
+      if (childrenEl.style.display === 'none') {
+        childrenEl.style.display = 'block';
+        icon.textContent = '▼';
+      } else {
+        childrenEl.style.display = 'none';
+        icon.textContent = '▶';
+      }
+    }
+
+    // Render streaming response
+    function renderStreamingResponse(sseData, expandedMessages = []) {
+      const lines = sseData.split('\n');
+      let fullText = '';
+      let toolUses = [];
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+
+        const dataStr = line.substring(6).trim();
+        if (!dataStr || dataStr === '[DONE]') continue;
+
+        try {
+          const data = JSON.parse(dataStr);
+
+          if (data.type === 'content_block_delta' && data.delta) {
+            if (data.delta.type === 'text_delta' && data.delta.text) {
+              fullText += data.delta.text;
+            }
+          }
+
+          if (data.type === 'content_block_start' && data.content_block) {
+            if (data.content_block.type === 'tool_use') {
+              toolUses.push(data.content_block);
+            }
+          }
+        } catch (e) {
+          // Ignore parse errors
+        }
+      }
+
+      let html = '<div class="messages">';
+
+      if (fullText) {
+        const content = escapeHtml(fullText);
+        const preview = content.substring(0, 100) + (content.length > 100 ? '...' : '');
+        const msgId = 'msg-streaming';
+        const isExpanded = expandedMessages.includes(msgId);
+        const collapsedClass = isExpanded ? '' : 'collapsed';
+        const iconClass = isExpanded ? '' : 'collapsed';
+
+        html += `
+          <div class="message assistant">
+            <div class="message-role" onclick="toggleMessageWithHistory('${msgId}')">
+              <span>assistant</span>
+              <span class="toggle-icon ${iconClass}" id="icon-${msgId}">▼</span>
+            </div>
+            <div class="message-preview ${isExpanded ? 'collapsed' : ''}" id="preview-${msgId}">${preview}</div>
+            <div class="message-content ${collapsedClass}" id="content-${msgId}">${content}</div>
+          </div>
+        `;
+      }
+
+      if (toolUses.length > 0) {
+        toolUses.forEach((tool, idx) => {
+          const toolId = `tool-${Date.now()}-${idx}`;
+          html += `
+            <div class="tool-use">
+              <div class="tool-name" onclick="toggleMessage('${toolId}')" style="cursor: pointer; user-select: none;">
+                🔧 ${tool.name}
+                <span class="toggle-icon collapsed" id="icon-${toolId}" style="float: right;">▼</span>
+              </div>
+              <div class="message-preview collapsed" id="preview-${toolId}">Tool parameters...</div>
+              <pre class="collapsed" id="content-${toolId}"><code>${JSON.stringify(tool.input || {}, null, 2)}</code></pre>
+            </div>
+          `;
+        });
+      }
+
+      html += '</div>';
+      return html;
+    }
+
+    // Utility: Escape HTML
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    // Start the app
+    init();
+  </script>
+</body>
+</html>

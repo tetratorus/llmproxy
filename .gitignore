@@ -1,0 +1,9 @@
+node_modules/
+requests.db
+requests.db-wal
+requests.db-shm
+test.db
+test.db-wal
+test.db-shm
+.env
+*.log
