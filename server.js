@@ -86,6 +86,10 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_model ON requests(model);
 `);
 
+// Idempotent migration: add `agent` column (Telegram bot username from path prefix).
+try { db.exec(`ALTER TABLE requests ADD COLUMN agent TEXT`); } catch (_) { /* already exists */ }
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_agent ON requests(agent)`); } catch (_) {}
+
 // FTS5 over body+response for the dashboard search (kept compatible with cproxy).
 try {
   db.exec(`
@@ -238,8 +242,13 @@ function passthroughResponseHeaders(interfaceName) {
   ];
 }
 
+// Bot-username validator: Telegram allows letters/digits/underscores, 5-32 chars,
+// must end in 'bot'. We only enforce shape here; collisions are impossible because
+// Telegram itself enforces global uniqueness.
+const AGENT_RE = /^[A-Za-z0-9_]{5,32}$/;
+
 // ── Generic proxy handler ────────────────────────────────────────────────
-async function handleProxy(providerKey, req, res) {
+async function handleProxy(providerKey, req, res, agent = null) {
   const provider = PROVIDERS[providerKey];
   const requestId = crypto.randomBytes(8).toString('hex');
   const startTime = Date.now();
@@ -249,8 +258,8 @@ async function handleProxy(providerKey, req, res) {
 
   db.prepare(`
     INSERT INTO requests (id, provider, interface, method, endpoint, headers, body,
-                          original_model, routed_model, user_agent, content_type, session_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          original_model, routed_model, user_agent, content_type, session_id, agent)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     requestId,
     providerKey,
@@ -264,9 +273,11 @@ async function handleProxy(providerKey, req, res) {
     req.headers['user-agent'] || null,
     req.headers['content-type'] || null,
     conversationId,
+    agent,
   );
 
-  console.log(`📥 ${providerKey} ${requestId} model=${originalModel} stream=${!!req.body.stream}`);
+  const agentTag = agent ? ` agent=${agent}` : '';
+  console.log(`📥 ${providerKey} ${requestId}${agentTag} model=${originalModel} stream=${!!req.body.stream}`);
 
   let upstreamResponse;
   try {
@@ -376,7 +387,21 @@ app.get('/models', (_req, res) => {
   res.json({ object: 'list', data });
 });
 
-app.post('/claude/v1/messages',         (req, res) => handleProxy('claude',   req, res));
+// Namespaced (preferred): /:agent is the Telegram bot username, e.g. matron_fece16_bot.
+// This makes the dashboard groupable per-agent without any nanobot-side change.
+function agentRoute(req, res, providerKey) {
+  const agent = req.params.agent;
+  if (!AGENT_RE.test(agent)) {
+    return res.status(400).json({ error: 'invalid agent', detail: 'agent must match ^[A-Za-z0-9_]{5,32}$' });
+  }
+  return handleProxy(providerKey, req, res, agent);
+}
+app.post('/:agent/claude/v1/messages',           (req, res) => agentRoute(req, res, 'claude'));
+app.post('/:agent/deepseek/v1/chat/completions', (req, res) => agentRoute(req, res, 'deepseek'));
+
+// Legacy non-namespaced (no agent attribution). Kept so the proxy can roll
+// independently of agent configs. Stored with agent=NULL.
+app.post('/claude/v1/messages',           (req, res) => handleProxy('claude',   req, res));
 app.post('/deepseek/v1/chat/completions', (req, res) => handleProxy('deepseek', req, res));
 
 // ── Dashboard endpoints (preserved from cproxy) ──────────────────────────
@@ -386,15 +411,36 @@ app.get('/api/requests', (req, res) => {
     const limit  = parseInt(req.query.limit) || 50;
     const offset = (page - 1) * limit;
     const search = req.query.search || '';
+    const agent  = req.query.agent || '';
     let total, rows;
     if (search) {
-      ({ total } = db.prepare(`SELECT COUNT(*) as total FROM requests_fts WHERE requests_fts MATCH ?`).get(search));
+      if (agent) {
+        ({ total } = db.prepare(`
+          SELECT COUNT(*) as total FROM requests_fts
+          JOIN requests r ON requests_fts.rowid = r.rowid
+          WHERE requests_fts MATCH ? AND r.agent = ?
+        `).get(search, agent));
+        rows = db.prepare(`
+          SELECT r.*, json_array_length(json_extract(r.body, '$.messages')) as message_count
+          FROM requests_fts JOIN requests r ON requests_fts.rowid = r.rowid
+          WHERE requests_fts MATCH ? AND r.agent = ?
+          ORDER BY r.timestamp DESC LIMIT ? OFFSET ?
+        `).all(search, agent, limit, offset);
+      } else {
+        ({ total } = db.prepare(`SELECT COUNT(*) as total FROM requests_fts WHERE requests_fts MATCH ?`).get(search));
+        rows = db.prepare(`
+          SELECT r.*, json_array_length(json_extract(r.body, '$.messages')) as message_count
+          FROM requests_fts JOIN requests r ON requests_fts.rowid = r.rowid
+          WHERE requests_fts MATCH ?
+          ORDER BY r.timestamp DESC LIMIT ? OFFSET ?
+        `).all(search, limit, offset);
+      }
+    } else if (agent) {
+      ({ total } = db.prepare(`SELECT COUNT(*) as total FROM requests WHERE agent = ?`).get(agent));
       rows = db.prepare(`
-        SELECT r.*, json_array_length(json_extract(r.body, '$.messages')) as message_count
-        FROM requests_fts JOIN requests r ON requests_fts.rowid = r.rowid
-        WHERE requests_fts MATCH ?
-        ORDER BY r.timestamp DESC LIMIT ? OFFSET ?
-      `).all(search, limit, offset);
+        SELECT *, json_array_length(json_extract(body, '$.messages')) as message_count
+        FROM requests WHERE agent = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?
+      `).all(agent, limit, offset);
     } else {
       ({ total } = db.prepare(`SELECT COUNT(*) as total FROM requests`).get());
       rows = db.prepare(`
