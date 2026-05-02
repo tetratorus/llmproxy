@@ -3,7 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Claude Request Explorer</title>
+  <base href="/llm/">
+  <title>LLM Proxy · Matron</title>
   <style>
     * {
       margin: 0;
@@ -498,6 +499,19 @@
         currentView: 'list',
         selectedRequest: null,
         currentSearch: '',
+        currentAgent: '',
+
+        // Populate agent filter from server
+        async loadAgents() {
+          try {
+            const resp = await fetch('/llm/api/agents');
+            if (resp.ok) {
+              this.availableAgents = await resp.json();
+            }
+          } catch (_) {
+            this.availableAgents = [];
+          }
+        },
 
         // Initialize
         init() {
@@ -514,6 +528,7 @@
               if (event.state.view === 'detail') {
                 loadRequest(event.state.id, event.state.search || '', true, event.state.expanded || []);
               } else if (event.state.view === 'list') {
+                this.currentAgent = event.state.agent || '';
                 this.loadRequests(event.state.page || 1, event.state.search || '', true);
               }
             } else {
@@ -528,6 +543,9 @@
           const id = urlParams.get('id');
           const page = parseInt(urlParams.get('page')) || 1;
           const search = urlParams.get('search') || '';
+          const agent = urlParams.get('agent') || '';
+          this.currentAgent = agent;
+          await this.loadAgents();
 
           if (view === 'detail' && id) {
             const expanded = urlParams.get('expanded') ? urlParams.get('expanded').split(',') : [];
@@ -561,7 +579,9 @@
           try {
             const searchQuery = search !== null ? search : this.currentSearch;
             const searchParam = searchQuery ? `&search=${encodeURIComponent(searchQuery)}` : '';
-            const response = await fetch(`/api/requests?page=${page}&limit=20${searchParam}`);
+            const agentParam = this.currentAgent ? `&agent=${encodeURIComponent(this.currentAgent)}` : '';
+
+            const response = await fetch(`/llm/api/requests?page=${page}&limit=20${searchParam}${agentParam}`);
             const data = await response.json();
 
             this.currentPage = page;
@@ -580,7 +600,12 @@
               } else {
                 url.searchParams.delete('search');
               }
-              history.pushState({ view: 'list', page, search: searchQuery }, '', url);
+              if (this.currentAgent) {
+                url.searchParams.set('agent', this.currentAgent);
+              } else {
+                url.searchParams.delete('agent');
+              }
+              history.pushState({ view: 'list', page, search: searchQuery, agent: this.currentAgent }, '', url);
             }
 
             renderRequestList(data.requests);
@@ -600,7 +625,7 @@
     // Load specific request
     async function loadRequest(id, searchTerm = '', skipHistory = false, expandedMessages = []) {
       try {
-        const response = await fetch(`/api/requests/${id}`);
+        const response = await fetch(`/llm/api/requests/${id}`);
         const data = await response.json();
         app.selectedRequest = data;
         app.currentView = 'detail';
@@ -635,7 +660,7 @@
     async function loadMorePreviousHistory(requestId, currentNav) {
       try {
         const offset = currentNav.prev_10.length;
-        const response = await fetch(`/api/requests/${requestId}/history?offset=${offset}&limit=10`);
+        const response = await fetch(`/llm/api/requests/${requestId}/history?offset=${offset}&limit=10`);
         const data = await response.json();
 
         if (data.prev_requests && data.prev_requests.length > 0) {
@@ -658,10 +683,14 @@
     function renderRequestList(requests) {
       if (requests.length === 0) {
         document.getElementById('app').innerHTML = `
-          <div class="search-bar">
+          <div class="search-bar" style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
             <input type="text" id="searchInput" placeholder="Search messages..." value="${app.currentSearch}" title="FTS5 Search: Use &quot;exact phrase&quot;, whisper*, AND, OR, NOT operators" style="padding: 8px 12px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-secondary); color: var(--text-primary); font-size: 14px; width: 300px;">
-            <button id="searchBtn" style="padding: 8px 16px; background: var(--accent); color: white; border: none; border-radius: 4px; cursor: pointer; margin-left: 8px;">Search</button>
-            ${app.currentSearch ? `<button id="clearBtn" style="padding: 8px 16px; background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; margin-left: 8px;">Clear</button>` : ''}
+            <select id="agentFilter" style="padding: 8px 12px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-secondary); color: var(--text-primary); font-size: 14px;">
+              <option value="">All agents</option>
+              ${app.availableAgents.map(a => `<option value="${a}" ${app.currentAgent === a ? 'selected' : ''}>${a}</option>`).join('')}
+            </select>
+            <button id="searchBtn" style="padding: 8px 16px; background: var(--accent); color: white; border: none; border-radius: 4px; cursor: pointer;">Search</button>
+            ${app.currentSearch ? `<button id="clearBtn" style="padding: 8px 16px; background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 4px; cursor: pointer;">Clear</button>` : ''}
           </div>
           <div class="stats-bar">
             <span>${app.currentSearch ? `No results for "${app.currentSearch}"` : 'No requests yet'}</span>
@@ -680,6 +709,8 @@
         if (searchBtn) {
           searchBtn.addEventListener('click', () => {
             const search = searchInput.value.trim();
+            const agentEl = document.getElementById('agentFilter');
+            app.currentAgent = agentEl ? agentEl.value : '';
             app.loadRequests(1, search);
           });
         }
@@ -688,13 +719,25 @@
           searchInput.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') {
               const search = searchInput.value.trim();
+              const agentEl = document.getElementById('agentFilter');
+              app.currentAgent = agentEl ? agentEl.value : '';
               app.loadRequests(1, search);
             }
           });
         }
 
+        // Agent filter (empty state)
+        const agentEl = document.getElementById('agentFilter');
+        if (agentEl) {
+          agentEl.addEventListener('change', () => {
+            app.currentAgent = agentEl.value;
+            app.loadRequests(1, app.currentSearch);
+          });
+        }
+
         if (clearBtn) {
           clearBtn.addEventListener('click', () => {
+            app.currentAgent = '';
             app.loadRequests(1, '');
           });
         }
@@ -735,10 +778,14 @@
         .join('');
 
       const html = `
-        <div class="search-bar">
+        <div class="search-bar" style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
           <input type="text" id="searchInput" placeholder="Search messages..." value="${app.currentSearch}" title="FTS5 Search: Use &quot;exact phrase&quot;, whisper*, AND, OR, NOT operators" style="padding: 8px 12px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-secondary); color: var(--text-primary); font-size: 14px; width: 300px;">
-          <button id="searchBtn" style="padding: 8px 16px; background: var(--accent); color: white; border: none; border-radius: 4px; cursor: pointer; margin-left: 8px;">Search</button>
-          ${app.currentSearch ? `<button id="clearBtn" style="padding: 8px 16px; background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; margin-left: 8px;">Clear</button>` : ''}
+          <select id="agentFilter" style="padding: 8px 12px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-secondary); color: var(--text-primary); font-size: 14px;">
+            <option value="">All agents</option>
+            ${app.availableAgents.map(a => `<option value="${a}" ${app.currentAgent === a ? 'selected' : ''}>${a}</option>`).join('')}
+          </select>
+          <button id="searchBtn" style="padding: 8px 16px; background: var(--accent); color: white; border: none; border-radius: 4px; cursor: pointer;">Search</button>
+          ${app.currentSearch ? `<button id="clearBtn" style="padding: 8px 16px; background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 4px; cursor: pointer;">Clear</button>` : ''}
         </div>
         <div class="stats-bar">
           <span><strong>${app.totalRequests}</strong> ${app.currentSearch ? `result${app.totalRequests !== 1 ? 's' : ''} for "${app.currentSearch}"` : 'total requests'}</span>
@@ -778,6 +825,8 @@
       if (searchBtn) {
         searchBtn.addEventListener('click', () => {
           const search = searchInput.value.trim();
+          const agentFilter = document.getElementById('agentFilter');
+          app.currentAgent = agentFilter ? agentFilter.value : '';
           app.loadRequests(1, search);
         });
       }
@@ -786,13 +835,25 @@
         searchInput.addEventListener('keypress', (e) => {
           if (e.key === 'Enter') {
             const search = searchInput.value.trim();
+            const agentFilter = document.getElementById('agentFilter');
+            app.currentAgent = agentFilter ? agentFilter.value : '';
             app.loadRequests(1, search);
           }
         });
       }
 
+      // Agent filter change handler
+      const agentFilter = document.getElementById('agentFilter');
+      if (agentFilter) {
+        agentFilter.addEventListener('change', () => {
+          app.currentAgent = agentFilter.value;
+          app.loadRequests(1, app.currentSearch);
+        });
+      }
+
       if (clearBtn) {
         clearBtn.addEventListener('click', () => {
+          app.currentAgent = '';
           app.loadRequests(1, '');
         });
       }
@@ -848,6 +909,7 @@
             <div style="display: flex; align-items: center; gap: 8px;">
               ${!isChild && hasChildren ? `<span class="toggle-icon" id="icon-${childrenId}" style="cursor: pointer; font-size: 14px; user-select: none;" onclick="event.stopPropagation(); toggleConversation('${childrenId}')">▼</span>` : ''}
               <span class="model-badge">${req.model || req.original_model || 'unknown'}</span>
+              ${req.agent ? `<span class="model-badge" style="background: var(--accent); color: white; border-color: var(--accent);">🤖 ${req.agent}</span>` : ''}
               <span class="status-badge ${statusClass}">${req.status_code || 'pending'}</span>
               ${messageCount > 0 ? `<span class="status-badge" style="background: var(--bg-primary); color: var(--text-primary); border: 1px solid var(--border);">💬 ${messageCount} msg${messageCount !== 1 ? 's' : ''} (${turns} turn${turns !== 1 ? 's' : ''})</span>` : ''}
               ${req.match_count > 0 ? `<span class="status-badge" style="background: var(--accent); color: white; border: 1px solid var(--accent);">🔍 ${req.match_count} match${req.match_count !== 1 ? 'es' : ''}</span>` : ''}

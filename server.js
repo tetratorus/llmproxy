@@ -466,6 +466,16 @@ app.get('/api/requests', (req, res) => {
   }
 });
 
+// List distinct agents (from request log, live)
+app.get('/api/agents', (_req, res) => {
+  try {
+    const rows = db.prepare('SELECT DISTINCT agent FROM requests WHERE agent IS NOT NULL ORDER BY agent').all();
+    res.json(rows.map(r => r.agent));
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to list agents', detail: e.message });
+  }
+});
+
 app.get('/api/requests/:id', (req, res) => {
   try {
     const r = db.prepare('SELECT * FROM requests WHERE id = ?').get(req.params.id);
