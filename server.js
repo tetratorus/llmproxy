@@ -213,8 +213,9 @@ db.exec(`
 // in the INSERT statement, so the default is only ever used by legacy rows.
 {
   const cols = db.prepare(`PRAGMA table_info(requests)`).all().map(c => c.name);
-  if (!cols.includes('provider'))  { db.exec(`ALTER TABLE requests ADD COLUMN provider  TEXT DEFAULT 'claude'`);    console.log(`📦 added column: provider  (default=claude)`); }
-  if (!cols.includes('interface')) { db.exec(`ALTER TABLE requests ADD COLUMN interface TEXT DEFAULT 'anthropic'`); console.log(`📦 added column: interface (default=anthropic)`); }
+  if (!cols.includes('provider'))     { db.exec(`ALTER TABLE requests ADD COLUMN provider  TEXT DEFAULT 'claude'`);    console.log(`📦 added column: provider  (default=claude)`); }
+  if (!cols.includes('interface'))    { db.exec(`ALTER TABLE requests ADD COLUMN interface TEXT DEFAULT 'anthropic'`); console.log(`📦 added column: interface (default=anthropic)`); }
+  if (!cols.includes('upstream_url')) { db.exec(`ALTER TABLE requests ADD COLUMN upstream_url TEXT`);                  console.log(`📦 added column: upstream_url`); }
 }
 db.exec(`CREATE INDEX IF NOT EXISTS idx_provider ON requests(provider);`);
 
@@ -609,8 +610,8 @@ async function handleProxy(providerEntry, req, res) {
 
   db.prepare(`
     INSERT INTO requests (id, provider, interface, method, endpoint, headers, body,
-                          original_model, routed_model, user_agent, content_type, session_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          original_model, routed_model, user_agent, content_type, session_id, upstream_url)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     requestId,
     providerKey,
@@ -624,6 +625,7 @@ async function handleProxy(providerEntry, req, res) {
     req.headers['user-agent'] || null,
     req.headers['content-type'] || null,
     conversationId,
+    upstreamUrl,
   );
 
   console.log(`📥 ${providerKey} ${requestId} ${req.method} ${req.path} → ${upstreamUrl} stream=${!!(isObjectBody && req.body.stream)}`);
@@ -1068,8 +1070,8 @@ function handleUpgrade(req, socket, head) {
   const protocol = (upstreamUrl.protocol === 'http:' || upstreamUrl.protocol === 'ws:') ? http : https;
 
   db.prepare(`
-    INSERT INTO requests (id, provider, interface, method, endpoint, headers, body, user_agent, content_type, session_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO requests (id, provider, interface, method, endpoint, headers, body, user_agent, content_type, session_id, upstream_url)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     requestId,
     providerKey,
@@ -1081,6 +1083,7 @@ function handleUpgrade(req, socket, head) {
     req.headers['user-agent'] || null,
     req.headers['content-type'] || null,
     crypto.randomBytes(6).toString('hex'),
+    upstreamUrl.toString(),
   );
 
   console.log(`🔌 ${providerKey} ${requestId} UPGRADE ${originalUrl} → ${upstreamUrl.toString()}`);
