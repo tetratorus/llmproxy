@@ -757,16 +757,37 @@ app.get('/api/requests', (req, res) => {
     const page   = parseInt(req.query.page)  || 1;
     const limit  = parseInt(req.query.limit) || 50;
     const offset = (page - 1) * limit;
-    const search = req.query.search || '';
+    const search = String(req.query.search || '').trim();
     let total, rows;
     if (search) {
-      ({ total } = db.prepare(`SELECT COUNT(*) as total FROM requests_fts WHERE requests_fts MATCH ?`).get(search));
+      // LIKE-based search across the request envelope (endpoint, provider,
+      // model, body, response) AND any matching frame payload via EXISTS.
+      // Replaces the FTS5-only search so WebSocket frames — where codex,
+      // realtime audio, and any other WS-shaped traffic actually lives —
+      // are findable from the dashboard.
+      const like = `%${search}%`;
+      ({ total } = db.prepare(`
+        SELECT COUNT(*) as total FROM requests
+        WHERE endpoint LIKE ? OR provider LIKE ? OR model LIKE ?
+           OR body LIKE ? OR response LIKE ?
+           OR EXISTS (
+             SELECT 1 FROM websocket_frames
+             WHERE websocket_frames.request_id = requests.id
+               AND websocket_frames.payload LIKE ?
+           )
+      `).get(like, like, like, like, like, like));
       rows = db.prepare(`
-        SELECT r.*, json_array_length(json_extract(r.body, '$.messages')) as message_count
-        FROM requests_fts JOIN requests r ON requests_fts.rowid = r.rowid
-        WHERE requests_fts MATCH ?
-        ORDER BY r.timestamp DESC LIMIT ? OFFSET ?
-      `).all(search, limit, offset);
+        SELECT *, json_array_length(json_extract(body, '$.messages')) as message_count
+        FROM requests
+        WHERE endpoint LIKE ? OR provider LIKE ? OR model LIKE ?
+           OR body LIKE ? OR response LIKE ?
+           OR EXISTS (
+             SELECT 1 FROM websocket_frames
+             WHERE websocket_frames.request_id = requests.id
+               AND websocket_frames.payload LIKE ?
+           )
+        ORDER BY timestamp DESC LIMIT ? OFFSET ?
+      `).all(like, like, like, like, like, like, limit, offset);
     } else {
       ({ total } = db.prepare(`SELECT COUNT(*) as total FROM requests`).get());
       rows = db.prepare(`
