@@ -14,7 +14,7 @@ const express = require('express');
 const Database = require('better-sqlite3');
 const crypto = require('crypto');
 
-const PORT = parseInt(process.env.PORT || '8182', 10);
+const PORT = parseInt(process.env.PORT || '8181', 10);
 const DB_PATH = process.env.LLMPROXY_DB || 'requests.db';
 const REQUEST_TIMEOUT = 300000; // 5 min
 
@@ -51,6 +51,34 @@ const PROVIDERS = {
       'deepseek-reasoner',
     ],
   },
+  openai: {
+    interface: 'openai',
+    upstream: 'https://api.openai.com/v1/chat/completions',
+    path: '/openai/v1/chat/completions',
+    default_headers: {},
+    models: [
+      'gpt-4o',
+      'gpt-4o-mini',
+      'gpt-4.1',
+      'gpt-4.1-mini',
+      'o1',
+      'o1-mini',
+    ],
+  },
+  // OpenRouter aggregates many model providers behind one OpenAI-shaped endpoint.
+  // We use this for Gemini (model id = "google/gemini-2.5-flash" etc.) per project decision
+  // to not hit Google's native API directly.
+  openrouter: {
+    interface: 'openai',
+    upstream: 'https://openrouter.ai/api/v1/chat/completions',
+    path: '/openrouter/v1/chat/completions',
+    default_headers: {},
+    models: [
+      'google/gemini-2.5-flash',
+      'google/gemini-2.5-pro',
+      'google/gemini-2.0-flash-001',
+    ],
+  },
 };
 
 // ── DB setup ─────────────────────────────────────────────────────────────
@@ -81,9 +109,43 @@ db.exec(`
     session_id TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_timestamp ON requests(timestamp DESC);
-  CREATE INDEX IF NOT EXISTS idx_provider ON requests(provider);
   CREATE INDEX IF NOT EXISTS idx_endpoint ON requests(endpoint);
   CREATE INDEX IF NOT EXISTS idx_model ON requests(model);
+`);
+
+// Migrate from cproxy's schema (no provider/interface columns). SQLite has no
+// "ADD COLUMN IF NOT EXISTS", so we check PRAGMA table_info and ADD only what's
+// missing. We use ADD COLUMN ... DEFAULT — SQLite stores the default in table
+// metadata and applies it on read for rows that predate the column, so existing
+// cproxy rows return provider='claude' / interface='anthropic' without any
+// UPDATE. That keeps the migration metadata-only and near-instant on a 10GB DB
+// instead of triggering a multi-GB rewrite. New inserts pass explicit values
+// in the INSERT statement, so the default is only ever used by legacy rows.
+{
+  const cols = db.prepare(`PRAGMA table_info(requests)`).all().map(c => c.name);
+  if (!cols.includes('provider'))  { db.exec(`ALTER TABLE requests ADD COLUMN provider  TEXT DEFAULT 'claude'`);    console.log(`📦 added column: provider  (default=claude)`); }
+  if (!cols.includes('interface')) { db.exec(`ALTER TABLE requests ADD COLUMN interface TEXT DEFAULT 'anthropic'`); console.log(`📦 added column: interface (default=anthropic)`); }
+}
+db.exec(`CREATE INDEX IF NOT EXISTS idx_provider ON requests(provider);`);
+
+// WebSocket frame log. Wired by the upgrade handler in a later phase; the table
+// is created up-front so adding the handler later is a code-only change with no
+// schema migration. Idempotent: safe to re-run on existing requests.db.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS websocket_frames (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    sequence INTEGER NOT NULL,
+    direction TEXT NOT NULL,
+    opcode INTEGER,
+    type TEXT,
+    bytes INTEGER,
+    payload TEXT,
+    FOREIGN KEY (request_id) REFERENCES requests(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_ws_frames_request ON websocket_frames(request_id, sequence);
+  CREATE INDEX IF NOT EXISTS idx_ws_frames_payload ON websocket_frames(payload);
 `);
 
 // FTS5 over body+response for the dashboard search (kept compatible with cproxy).
@@ -105,6 +167,151 @@ try {
   `);
 } catch (e) {
   console.warn('FTS5 setup skipped:', e.message);
+}
+
+// Try to parse a stored response as JSON; if that fails (SSE stream, malformed
+// upstream payload, OpenRouter's leading ": OPENROUTER PROCESSING" comment line,
+// etc.) return the raw string. Used by /api/requests so the dashboard never
+// gets a half-parsed object that breaks downstream type assumptions.
+function parseStoredResponse(s) {
+  if (!s) return null;
+  try { return JSON.parse(s); } catch (_) { return s; }
+}
+
+// ── WebSocket frame helpers (pure, wired in a later phase) ───────────────
+// RFC 6455 frame parser/encoder. Used by the upgrade handler to log each frame
+// in both directions. These are pure functions with no side effects and are
+// dormant until handleUpgrade is registered.
+function decodeWebSocketOpcode(opcode) {
+  return {
+    0x0: 'continuation',
+    0x1: 'text',
+    0x2: 'binary',
+    0x8: 'close',
+    0x9: 'ping',
+    0xa: 'pong',
+  }[opcode] || `opcode_${opcode}`;
+}
+
+function readableFramePayload(opcode, payload) {
+  if (opcode === 0x1) return payload.toString('utf8');
+  if (opcode === 0x2) {
+    const text = payload.toString('utf8');
+    if (!text.includes('\uFFFD')) return text;
+    return `[binary base64] ${payload.toString('base64')}`;
+  }
+  return payload.length ? payload.toString('base64') : '';
+}
+
+function encodeWebSocketFrame({ opcode, payload, masked = false }) {
+  const payloadBuffer = Buffer.isBuffer(payload) ? payload : Buffer.from(String(payload || ''), 'utf8');
+  let lengthBytes;
+  if (payloadBuffer.length < 126) {
+    lengthBytes = Buffer.from([payloadBuffer.length]);
+  } else if (payloadBuffer.length <= 0xffff) {
+    lengthBytes = Buffer.from([126, payloadBuffer.length >> 8, payloadBuffer.length & 0xff]);
+  } else {
+    lengthBytes = Buffer.alloc(9);
+    lengthBytes[0] = 127;
+    lengthBytes.writeBigUInt64BE(BigInt(payloadBuffer.length), 1);
+  }
+  const firstByte = 0x80 | (opcode & 0x0f);
+  if (!masked) return Buffer.concat([Buffer.from([firstByte]), lengthBytes, payloadBuffer]);
+  lengthBytes[0] |= 0x80;
+  const mask = crypto.randomBytes(4);
+  const maskedPayload = Buffer.from(payloadBuffer);
+  for (let i = 0; i < maskedPayload.length; i += 1) maskedPayload[i] ^= mask[i % 4];
+  return Buffer.concat([Buffer.from([firstByte]), lengthBytes, mask, maskedPayload]);
+}
+
+// Streaming parser. Feed it chunks from a TCP socket; it emits one frame at a
+// time via onFrame, reassembling fragmented (FIN=0) frames first. Continuation
+// frames inherit the original frame's opcode. Each emitted frame carries the
+// raw bytes so the caller can re-forward them unmodified.
+function createWebSocketFrameParser(onFrame) {
+  let buffer = Buffer.alloc(0);
+  let fragmentedOpcode = null;
+  let fragmentedPayloads = [];
+  let fragmentedRawFrames = [];
+  let pending = Promise.resolve();
+  const emitFrame = frame => {
+    pending = pending.then(() => onFrame(frame)).catch(error => {
+      console.error('WebSocket frame handler error:', error);
+    });
+  };
+  return chunk => {
+    if (!chunk || !chunk.length) return;
+    buffer = Buffer.concat([buffer, chunk]);
+    while (buffer.length >= 2) {
+      const firstByte = buffer[0];
+      const secondByte = buffer[1];
+      const fin = Boolean(firstByte & 0x80);
+      const opcode = firstByte & 0x0f;
+      const masked = Boolean(secondByte & 0x80);
+      let payloadLength = secondByte & 0x7f;
+      let offset = 2;
+      if (payloadLength === 126) {
+        if (buffer.length < offset + 2) return;
+        payloadLength = buffer.readUInt16BE(offset);
+        offset += 2;
+      } else if (payloadLength === 127) {
+        if (buffer.length < offset + 8) return;
+        const bigLength = buffer.readBigUInt64BE(offset);
+        if (bigLength > BigInt(Number.MAX_SAFE_INTEGER)) { buffer = Buffer.alloc(0); return; }
+        payloadLength = Number(bigLength);
+        offset += 8;
+      }
+      const maskOffset = offset;
+      if (masked) offset += 4;
+      if (buffer.length < offset + payloadLength) return;
+      const rawFrame = Buffer.from(buffer.subarray(0, offset + payloadLength));
+      const payload = Buffer.from(buffer.subarray(offset, offset + payloadLength));
+      if (masked) {
+        const mask = buffer.subarray(maskOffset, maskOffset + 4);
+        for (let i = 0; i < payload.length; i += 1) payload[i] ^= mask[i % 4];
+      }
+      buffer = buffer.subarray(offset + payloadLength);
+      if (opcode === 0x0) {
+        fragmentedPayloads.push(payload);
+        fragmentedRawFrames.push(rawFrame);
+        if (fin && fragmentedOpcode !== null) {
+          const completePayload = Buffer.concat(fragmentedPayloads);
+          emitFrame({
+            opcode: fragmentedOpcode,
+            type: decodeWebSocketOpcode(fragmentedOpcode),
+            payload: readableFramePayload(fragmentedOpcode, completePayload),
+            bytes: completePayload.length,
+            raw: Buffer.concat(fragmentedRawFrames),
+          });
+          fragmentedOpcode = null;
+          fragmentedPayloads = [];
+          fragmentedRawFrames = [];
+        }
+      } else if (opcode === 0x1 || opcode === 0x2) {
+        if (fin) {
+          emitFrame({
+            opcode,
+            type: decodeWebSocketOpcode(opcode),
+            payload: readableFramePayload(opcode, payload),
+            bytes: payload.length,
+            raw: rawFrame,
+          });
+        } else {
+          fragmentedOpcode = opcode;
+          fragmentedPayloads = [payload];
+          fragmentedRawFrames = [rawFrame];
+        }
+      } else {
+        emitFrame({
+          opcode,
+          type: decodeWebSocketOpcode(opcode),
+          payload: readableFramePayload(opcode, payload),
+          bytes: payload.length,
+          raw: rawFrame,
+        });
+      }
+    }
+  };
 }
 
 // ── App setup ────────────────────────────────────────────────────────────
@@ -376,8 +583,24 @@ app.get('/models', (_req, res) => {
   res.json({ object: 'list', data });
 });
 
-app.post('/claude/v1/messages',         (req, res) => handleProxy('claude',   req, res));
-app.post('/deepseek/v1/chat/completions', (req, res) => handleProxy('deepseek', req, res));
+app.post('/claude/v1/messages',           (req, res) => handleProxy('claude',     req, res));
+app.post('/deepseek/v1/chat/completions', (req, res) => handleProxy('deepseek',   req, res));
+app.post('/openai/v1/chat/completions',   (req, res) => handleProxy('openai',     req, res));
+app.post('/openrouter/v1/chat/completions', (req, res) => handleProxy('openrouter', req, res));
+
+// ── cproxy-compatibility aliases ─────────────────────────────────────────
+// Claude Code sets ANTHROPIC_BASE_URL=http://localhost:8181 and calls /v1/messages
+// (no namespace prefix). We forward that to the claude provider so llmproxy is a
+// drop-in replacement for cproxy. Same for /v1/models.
+app.post('/v1/messages', (req, res) => handleProxy('claude', req, res));
+
+app.get('/v1/models', (_req, res) => {
+  // OpenAI-compat shape — what Claude Code's /model picker expects.
+  const data = PROVIDERS.claude.models.map(id => ({
+    id, object: 'model', created: 1677610602, owned_by: 'anthropic',
+  }));
+  res.json({ object: 'list', data });
+});
 
 // ── Dashboard endpoints (preserved from cproxy) ──────────────────────────
 app.get('/api/requests', (req, res) => {
@@ -408,7 +631,7 @@ app.get('/api/requests', (req, res) => {
           ...r,
           headers:  r.headers ? JSON.parse(r.headers) : null,
           body:     r.body ? JSON.parse(r.body) : null,
-          response: r.response ? (r.response.startsWith('data:') ? r.response : JSON.parse(r.response)) : null,
+          response: parseStoredResponse(r.response),
           message_count: r.message_count || 0,
         };
       } catch (_) { return r; }
@@ -427,12 +650,87 @@ app.get('/api/requests/:id', (req, res) => {
     try {
       r.headers  = r.headers ? JSON.parse(r.headers) : null;
       r.body     = r.body ? JSON.parse(r.body) : null;
-      r.response = r.response ? (r.response.startsWith('data:') ? r.response : JSON.parse(r.response)) : null;
+      r.response = parseStoredResponse(r.response);
     } catch (_) {}
+
+    // Conversation navigation (ported from cproxy). Walks the same session_id
+    // by message_count steps of 2 (user + assistant turn), so the dashboard
+    // can step prev/next through a conversation thread.
+    if (r.session_id && r.body && r.body.messages) {
+      const msgCount = r.body.messages.length;
+      const prev10 = [];
+      const prevStmt = db.prepare(`
+        SELECT id, timestamp FROM requests
+        WHERE session_id = ? AND json_array_length(json_extract(body, '$.messages')) = ?
+        ORDER BY timestamp DESC LIMIT 1
+      `);
+      for (let i = 1; i <= 10; i++) {
+        const targetCount = msgCount - (i * 2);
+        if (targetCount <= 0) break;
+        const prev = prevStmt.get(r.session_id, targetCount);
+        if (prev) prev10.push({ id: prev.id, msg_count: targetCount, timestamp: prev.timestamp });
+      }
+      const minMsgCount = prev10.length > 0 ? prev10[prev10.length - 1].msg_count : msgCount;
+      const hasMorePrev = db.prepare(`
+        SELECT COUNT(*) as count FROM requests
+        WHERE session_id = ? AND json_array_length(json_extract(body, '$.messages')) < ?
+      `).get(r.session_id, minMsgCount - 2).count > 0;
+      const nextReqs = db.prepare(`
+        SELECT id, timestamp FROM requests
+        WHERE session_id = ? AND json_array_length(json_extract(body, '$.messages')) = ?
+        ORDER BY timestamp ASC
+      `).all(r.session_id, msgCount + 2);
+      r.navigation = {
+        conversation_id: r.session_id,
+        msg_count: msgCount,
+        prev_10: prev10.reverse(),
+        has_more_prev: hasMorePrev,
+        next: nextReqs.map(n => ({ id: n.id, msg_count: msgCount + 2, timestamp: n.timestamp })),
+      };
+    }
+
     res.json(r);
   } catch (e) {
     console.error('GET /api/requests/:id error:', e);
     res.status(500).json({ error: 'Failed to get request' });
+  }
+});
+
+// Older history pages for a conversation (ported from cproxy). Used by the
+// dashboard to lazy-load earlier turns past the initial prev_10 window.
+app.get('/api/requests/:id/history', (req, res) => {
+  try {
+    const r = db.prepare('SELECT session_id, body FROM requests WHERE id = ?').get(req.params.id);
+    if (!r) return res.status(404).json({ error: 'Request not found' });
+    const body = r.body ? JSON.parse(r.body) : null;
+    if (!body || !body.messages) return res.json({ prev_requests: [], has_more: false });
+
+    const msgCount = body.messages.length;
+    const offset = parseInt(req.query.offset) || 10;
+    const limit  = parseInt(req.query.limit)  || 10;
+
+    const prevStmt = db.prepare(`
+      SELECT id, timestamp FROM requests
+      WHERE session_id = ? AND json_array_length(json_extract(body, '$.messages')) = ?
+      ORDER BY timestamp DESC LIMIT 1
+    `);
+    const prevRequests = [];
+    for (let i = offset; i < offset + limit; i++) {
+      const targetCount = msgCount - (i * 2);
+      if (targetCount <= 0) break;
+      const prev = prevStmt.get(r.session_id, targetCount);
+      if (prev) prevRequests.push({ id: prev.id, msg_count: targetCount, timestamp: prev.timestamp });
+    }
+    const minMsgCount = prevRequests.length > 0 ? prevRequests[prevRequests.length - 1].msg_count : 0;
+    const hasMore = minMsgCount > 0 && db.prepare(`
+      SELECT COUNT(*) as count FROM requests
+      WHERE session_id = ? AND json_array_length(json_extract(body, '$.messages')) < ?
+    `).get(r.session_id, minMsgCount - 2).count > 0;
+
+    res.json({ prev_requests: prevRequests.reverse(), has_more: hasMore });
+  } catch (e) {
+    console.error('GET /api/requests/:id/history error:', e);
+    res.status(500).json({ error: 'Failed to get history' });
   }
 });
 
