@@ -817,6 +817,29 @@ app.get('/api/requests/:id/history', (req, res) => {
   }
 });
 
+// Paginated WebSocket frame log for a given request. Returned in sequence
+// order so the dashboard can replay the conversation.
+app.get('/api/requests/:id/websocket-frames', (req, res) => {
+  try {
+    const offset = parseInt(req.query.offset) || 0;
+    const limit  = Math.min(parseInt(req.query.limit) || 100, 1000);
+    const { c: total } = db.prepare(
+      `SELECT COUNT(*) as c FROM websocket_frames WHERE request_id = ?`
+    ).get(req.params.id);
+    const frames = db.prepare(`
+      SELECT id, timestamp, sequence, direction, opcode, type, bytes, payload
+      FROM websocket_frames
+      WHERE request_id = ?
+      ORDER BY sequence ASC
+      LIMIT ? OFFSET ?
+    `).all(req.params.id, limit, offset);
+    res.json({ frames, total, offset, limit, has_more: offset + frames.length < total });
+  } catch (e) {
+    console.error('GET /api/requests/:id/websocket-frames error:', e);
+    res.status(500).json({ error: 'Failed to get frames' });
+  }
+});
+
 // ── Generic prefix routing ───────────────────────────────────────────────
 // Catches anything under /<provider-prefix>/... that wasn't matched by an
 // explicit route above (dashboard, /health, /models, /v1/* aliases). Forwards
