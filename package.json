@@ -9,7 +9,11 @@
     "test": "node test.js",
     "test:claude": "node test.js claude",
     "test:deepseek": "node test.js deepseek",
-    "test:models": "node test.js models"
+    "test:openai": "node test.js openai",
+    "test:openrouter": "node test.js openrouter",
+    "test:models": "node test.js models",
+    "test:dashboard": "node test.js dashboard",
+    "test:websocket": "node test.js websocket"
   },
   "keywords": ["llm", "proxy", "anthropic", "deepseek", "observability"],
   "license": "ISC",
