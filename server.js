@@ -19,6 +19,8 @@ const https = require('https');
 const PORT = parseInt(process.env.PORT || '8181', 10);
 const DB_PATH = process.env.LLMPROXY_DB || 'requests.db';
 const REQUEST_TIMEOUT = 300000; // 5 min
+// chars of payload context to surface around each search-matched WS frame snippet
+const WEBSOCKET_SEARCH_SNIPPET_LIMIT = parseInt(process.env.WEBSOCKET_SEARCH_SNIPPET_LIMIT_CHARS || '500', 10);
 
 // ── Provider registry ────────────────────────────────────────────────────
 //
@@ -777,7 +779,27 @@ app.get('/api/requests', (req, res) => {
            )
       `).get(like, like, like, like, like, like));
       rows = db.prepare(`
-        SELECT *, json_array_length(json_extract(body, '$.messages')) as message_count
+        SELECT
+          requests.*,
+          json_array_length(json_extract(body, '$.messages')) AS message_count,
+          (SELECT COUNT(*) FROM websocket_frames WHERE websocket_frames.request_id = requests.id) AS websocket_frame_count,
+          (
+            SELECT json_group_array(json_object(
+              'sequence', sequence,
+              'timestamp', timestamp,
+              'direction', direction,
+              'type', type,
+              'bytes', bytes,
+              'snippet', substr(payload, max(1, instr(payload, ?) - 160), ?)
+            ))
+            FROM (
+              SELECT sequence, timestamp, direction, type, bytes, payload
+              FROM websocket_frames
+              WHERE websocket_frames.request_id = requests.id AND payload LIKE ?
+              ORDER BY sequence
+              LIMIT 5
+            )
+          ) AS websocket_matches
         FROM requests
         WHERE endpoint LIKE ? OR provider LIKE ? OR model LIKE ?
            OR body LIKE ? OR response LIKE ?
@@ -787,11 +809,15 @@ app.get('/api/requests', (req, res) => {
                AND websocket_frames.payload LIKE ?
            )
         ORDER BY timestamp DESC LIMIT ? OFFSET ?
-      `).all(like, like, like, like, like, like, limit, offset);
+      `).all(search, WEBSOCKET_SEARCH_SNIPPET_LIMIT, like, like, like, like, like, like, like, limit, offset);
     } else {
       ({ total } = db.prepare(`SELECT COUNT(*) as total FROM requests`).get());
       rows = db.prepare(`
-        SELECT *, json_array_length(json_extract(body, '$.messages')) as message_count
+        SELECT
+          requests.*,
+          json_array_length(json_extract(body, '$.messages')) AS message_count,
+          (SELECT COUNT(*) FROM websocket_frames WHERE websocket_frames.request_id = requests.id) AS websocket_frame_count,
+          NULL AS websocket_matches
         FROM requests ORDER BY timestamp DESC LIMIT ? OFFSET ?
       `).all(limit, offset);
     }
@@ -803,6 +829,8 @@ app.get('/api/requests', (req, res) => {
           body:     r.body ? JSON.parse(r.body) : null,
           response: parseStoredResponse(r.response),
           message_count: r.message_count || 0,
+          websocket_frame_count: r.websocket_frame_count || 0,
+          websocket_matches: r.websocket_matches ? JSON.parse(r.websocket_matches) : null,
         };
       } catch (_) { return r; }
     });
@@ -815,12 +843,18 @@ app.get('/api/requests', (req, res) => {
 
 app.get('/api/requests/:id', (req, res) => {
   try {
-    const r = db.prepare('SELECT * FROM requests WHERE id = ?').get(req.params.id);
+    const r = db.prepare(`
+      SELECT
+        requests.*,
+        (SELECT COUNT(*) FROM websocket_frames WHERE websocket_frames.request_id = requests.id) AS websocket_frame_count
+      FROM requests WHERE id = ?
+    `).get(req.params.id);
     if (!r) return res.status(404).json({ error: 'Request not found' });
     try {
       r.headers  = r.headers ? JSON.parse(r.headers) : null;
       r.body     = r.body ? JSON.parse(r.body) : null;
       r.response = parseStoredResponse(r.response);
+      r.websocket_frame_count = r.websocket_frame_count || 0;
     } catch (_) {}
 
     // Conversation navigation (ported from cproxy). Walks the same session_id
