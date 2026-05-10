@@ -404,7 +404,24 @@ function createWebSocketFrameParser(onFrame) {
 
 // ── App setup ────────────────────────────────────────────────────────────
 const app = express();
-app.use(express.json({ limit: '50mb' }));
+// Type-aware body parsers, in priority order. Each only handles its declared
+// content-types; anything else falls through to the next. `express.raw`
+// catches binary uploads (multipart, audio, video, PDFs) so they reach
+// upstream byte-for-byte instead of being silently dropped by a JSON-only
+// pipeline.
+app.use(express.json({ limit: '50mb', type: ['application/json', 'application/*+json'] }));
+app.use(express.text({ limit: '50mb', type: ['text/*', 'application/x-ndjson'] }));
+app.use(express.raw({
+  limit: '50mb',
+  type: [
+    'application/octet-stream',
+    'multipart/*',
+    'image/*',
+    'audio/*',
+    'video/*',
+    'application/pdf',
+  ],
+}));
 app.use(express.static(__dirname));
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -531,6 +548,29 @@ function buildUpstreamHeaders(req) {
   return out;
 }
 
+// Type-aware body forwarder. JSON objects re-stringify (re-stringify is
+// fine — express.json already lost original byte-order, and the upstream
+// just parses it again); strings (ndjson, text) and Buffers (multipart,
+// images, audio) pass through verbatim.
+function buildUpstreamBody(req) {
+  if (req.method === 'GET' || req.method === 'HEAD') return undefined;
+  if (req.body === undefined) return undefined;
+  if (Buffer.isBuffer(req.body)) return req.body;
+  if (typeof req.body === 'string') return req.body;
+  if (typeof req.body === 'object' && Object.keys(req.body).length === 0) return undefined;
+  return JSON.stringify(req.body);
+}
+
+// Persist req.body to the requests.body column. For Buffers we store base64
+// rather than corrupting the column with binary; for strings, store as-is;
+// for objects, stringify; for missing, store null.
+function safeJson(value) {
+  if (value === undefined) return null;
+  if (Buffer.isBuffer(value)) return JSON.stringify({ binary: true, encoding: 'base64', data: value.toString('base64') });
+  if (typeof value === 'string') return value;
+  return JSON.stringify(value);
+}
+
 // Headers we forward back from upstream → client (rate-limit etc, by interface).
 function passthroughResponseHeaders(interfaceName) {
   if (interfaceName === 'anthropic') {
@@ -558,8 +598,12 @@ async function handleProxy(providerEntry, req, res) {
   const search = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
   const upstreamUrl = joinUrl(provider.upstreamBase, upstreamPath) + search;
 
-  const originalModel = req.body && req.body.model;
-  const conversationId = generateConversationId(req.body && req.body.messages);
+  // Only object-shaped JSON bodies expose model/messages for our metadata.
+  // For string (ndjson, text) and Buffer (binary uploads) bodies, these stay
+  // null and the row is just persisted as raw transport.
+  const isObjectBody = req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body);
+  const originalModel = isObjectBody ? req.body.model : null;
+  const conversationId = generateConversationId(isObjectBody ? req.body.messages : null);
 
   db.prepare(`
     INSERT INTO requests (id, provider, interface, method, endpoint, headers, body,
@@ -572,7 +616,7 @@ async function handleProxy(providerEntry, req, res) {
     req.method,
     req.path,
     JSON.stringify(sanitizeHeaders(req.headers)),
-    JSON.stringify(req.body),
+    safeJson(req.body),
     originalModel,
     originalModel,
     req.headers['user-agent'] || null,
@@ -580,14 +624,7 @@ async function handleProxy(providerEntry, req, res) {
     conversationId,
   );
 
-  console.log(`📥 ${providerKey} ${requestId} ${req.method} ${req.path} → ${upstreamUrl} stream=${!!(req.body && req.body.stream)}`);
-
-  // express.json() leaves req.body undefined for non-POST requests and for
-  // bodies that aren't application/json. For now we only forward a body when
-  // the parser populated one — sufficient for chat-completions / messages
-  // shapes. Non-JSON bodies (file uploads, multipart) are out of scope for
-  // this phase.
-  const hasBody = req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0;
+  console.log(`📥 ${providerKey} ${requestId} ${req.method} ${req.path} → ${upstreamUrl} stream=${!!(isObjectBody && req.body.stream)}`);
 
   let upstreamResponse;
   try {
@@ -596,7 +633,7 @@ async function handleProxy(providerEntry, req, res) {
     upstreamResponse = await fetch(upstreamUrl, {
       method: req.method,
       headers: buildUpstreamHeaders(req),
-      body: hasBody ? JSON.stringify(req.body) : undefined,
+      body: buildUpstreamBody(req),
       signal: controller.signal,
     });
     clearTimeout(timeoutId);
@@ -613,7 +650,11 @@ async function handleProxy(providerEntry, req, res) {
     if (v) res.setHeader(h, v);
   }
 
-  if (req.body && req.body.stream) {
+  // Detect SSE from response Content-Type as well as request body.stream — non-JSON
+  // requests (e.g. ndjson or binary) might still elicit a streamed response.
+  const upstreamContentType = upstreamResponse.headers.get('content-type') || '';
+  const isStream = upstreamContentType.includes('text/event-stream') || (isObjectBody && req.body.stream);
+  if (isStream) {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
