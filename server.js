@@ -827,6 +827,200 @@ app.use((req, res, next) => {
   return handleProxy(entry, req, res);
 });
 
+// ── WebSocket upgrade handler ────────────────────────────────────────────
+// Reuses the same provider/path resolution as HTTP. The upstream is reached
+// via http(s).request with the client's Upgrade headers preserved; on the
+// upstream's 101, both directions are tee'd through the frame parser and
+// each frame is logged to websocket_frames.
+
+function statusLine(req, statusCode, statusMessage) {
+  return `HTTP/${req.httpVersion} ${statusCode} ${statusMessage || http.STATUS_CODES[statusCode] || ''}\r\n`;
+}
+
+function rawHeaderLines(headers, options = {}) {
+  const lines = [];
+  const preserveUpgradeHeaders = Boolean(options.preserveUpgradeHeaders);
+  for (let i = 0; i < headers.length; i += 2) {
+    const lowerKey = headers[i].toLowerCase();
+    const isUpgradeHeader = lowerKey === 'connection' || lowerKey === 'upgrade';
+    if (shouldSkipHeader(headers[i]) && !(preserveUpgradeHeaders && isUpgradeHeader)) continue;
+    // permessage-deflate would require us to also negotiate compression with
+    // the client — skip it so the upstream sends uncompressed frames we can
+    // parse, log, and forward.
+    if (preserveUpgradeHeaders && lowerKey === 'sec-websocket-extensions') continue;
+    lines.push(`${headers[i]}: ${headers[i + 1]}\r\n`);
+  }
+  return lines.join('');
+}
+
+function createWebSocketLogWriter({ requestId, startTime, forwardClientFrame, forwardServerFrame }) {
+  let sequence = 0;
+  let clientFrames = 0;
+  let serverFrames = 0;
+  const insertFrame = db.prepare(`
+    INSERT INTO websocket_frames (request_id, timestamp, sequence, direction, opcode, type, bytes, payload)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const updateSummary = db.prepare(`
+    UPDATE requests
+    SET status_code = ?, response_time = ?, response = ?
+    WHERE id = ?
+  `);
+  const persist = statusCode => {
+    updateSummary.run(
+      statusCode,
+      Date.now() - startTime,
+      JSON.stringify({ websocket: true, client_frames: clientFrames, server_frames: serverFrames }),
+      requestId,
+    );
+  };
+  const record = (direction, frame) => {
+    sequence += 1;
+    if (direction === 'client') clientFrames += 1;
+    else serverFrames += 1;
+    insertFrame.run(
+      requestId,
+      new Date().toISOString(),
+      sequence,
+      direction,
+      frame.opcode,
+      frame.type,
+      frame.bytes,
+      String(frame.payload || ''),
+    );
+  };
+  return {
+    client: createWebSocketFrameParser(frame => {
+      record('client', frame);
+      persist(101);
+      forwardClientFrame(frame.raw);
+    }),
+    server: createWebSocketFrameParser(frame => {
+      record('server', frame);
+      persist(101);
+      forwardServerFrame(frame.raw);
+    }),
+    persist,
+  };
+}
+
+function handleUpgrade(req, socket, head) {
+  // Default error handler so a socket error before the upstream connection is
+  // established can't take the process down.
+  socket.on('error', () => { try { socket.destroy(); } catch (_) {} });
+
+  const originalUrl = req.url || '/';
+  const entry = stripProviderPrefix(originalUrl.split('?')[0]);
+  if (!entry) {
+    socket.destroy();
+    return;
+  }
+  const { name: providerKey, config: provider, providerPath } = entry;
+
+  const requestId = crypto.randomBytes(8).toString('hex');
+  const startTime = Date.now();
+  const search = originalUrl.includes('?') ? originalUrl.slice(originalUrl.indexOf('?')) : '';
+  const upstreamUrl = new URL(joinUrl(provider.upstreamBase, upstreamPathFor(provider, providerPath)) + search);
+  const protocol = (upstreamUrl.protocol === 'http:' || upstreamUrl.protocol === 'ws:') ? http : https;
+
+  db.prepare(`
+    INSERT INTO requests (id, provider, interface, method, endpoint, headers, body, user_agent, content_type, session_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    requestId,
+    providerKey,
+    provider.interface,
+    req.method,
+    originalUrl.split('?')[0],
+    JSON.stringify(sanitizeHeaders(req.headers)),
+    JSON.stringify({ websocket: true, upstream_url: upstreamUrl.toString() }),
+    req.headers['user-agent'] || null,
+    req.headers['content-type'] || null,
+    crypto.randomBytes(6).toString('hex'),
+  );
+
+  console.log(`🔌 ${providerKey} ${requestId} UPGRADE ${originalUrl} → ${upstreamUrl.toString()}`);
+
+  // Build raw upstream headers — preserve Connection/Upgrade, drop host (we
+  // set it from the upstream URL), drop content-length, drop
+  // sec-websocket-extensions (no compression).
+  const rawUpstreamHeaders = ['Host', upstreamUrl.host];
+  for (let i = 0; i < req.rawHeaders.length; i += 2) {
+    const name = req.rawHeaders[i];
+    const lower = name.toLowerCase();
+    if (lower === 'host' || lower === 'content-length' || lower === 'sec-websocket-extensions') continue;
+    rawUpstreamHeaders.push(name, req.rawHeaders[i + 1]);
+  }
+
+  const upstreamReq = protocol.request({
+    hostname: upstreamUrl.hostname,
+    port: upstreamUrl.port || undefined,
+    setHost: false,
+    path: `${upstreamUrl.pathname}${upstreamUrl.search}`,
+    method: req.method,
+    headers: rawUpstreamHeaders,
+  });
+
+  upstreamReq.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
+    upstreamSocket.on('error', () => { try { upstreamSocket.destroy(); } catch (_) {} });
+
+    const wsLog = createWebSocketLogWriter({
+      requestId,
+      startTime,
+      forwardClientFrame: bytes => upstreamSocket.write(bytes),
+      forwardServerFrame: bytes => socket.write(bytes),
+    });
+    wsLog.persist(upstreamRes.statusCode);
+
+    socket.write(statusLine(req, upstreamRes.statusCode, upstreamRes.statusMessage));
+    socket.write(rawHeaderLines(upstreamRes.rawHeaders, { preserveUpgradeHeaders: true }));
+    socket.write('\r\n');
+    if (upstreamHead && upstreamHead.length) wsLog.server(upstreamHead);
+    if (head && head.length) wsLog.client(head);
+
+    socket.on('data', chunk => wsLog.client(chunk));
+    upstreamSocket.on('data', chunk => wsLog.server(chunk));
+    socket.on('end', () => { try { upstreamSocket.end(); } catch (_) {} });
+    upstreamSocket.on('end', () => { try { socket.end(); } catch (_) {} });
+    socket.on('close', () => { wsLog.persist(upstreamRes.statusCode); try { upstreamSocket.destroy(); } catch (_) {} });
+    upstreamSocket.on('close', () => { wsLog.persist(upstreamRes.statusCode); try { socket.destroy(); } catch (_) {} });
+  });
+
+  // Upstream returned a normal HTTP response instead of upgrading — surface
+  // that back to the client unchanged. Common when the upstream rejects auth
+  // before considering the upgrade.
+  upstreamReq.on('response', upstreamRes => {
+    const chunks = [];
+    upstreamRes.on('data', c => chunks.push(c));
+    upstreamRes.on('end', () => {
+      const body = Buffer.concat(chunks);
+      db.prepare(`UPDATE requests SET response = ?, status_code = ?, response_time = ? WHERE id = ?`)
+        .run(body.toString('utf8'), upstreamRes.statusCode, Date.now() - startTime, requestId);
+      try {
+        socket.write(statusLine(req, upstreamRes.statusCode, upstreamRes.statusMessage));
+        socket.write(rawHeaderLines(upstreamRes.rawHeaders));
+        socket.write('\r\n');
+        socket.write(body);
+        socket.end();
+      } catch (_) { /* client gone */ }
+    });
+  });
+
+  upstreamReq.on('error', err => {
+    console.error(`❌ ${providerKey} ${requestId} upgrade error:`, err.message);
+    db.prepare(`UPDATE requests SET response = ?, status_code = ?, response_time = ? WHERE id = ?`)
+      .run(JSON.stringify({ error: err.message }), 502, Date.now() - startTime, requestId);
+    try {
+      socket.end(
+        'HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\n\r\n' +
+        JSON.stringify({ error: 'Proxy upgrade error', message: err.message })
+      );
+    } catch (_) { /* client gone */ }
+  });
+
+  upstreamReq.end();
+}
+
 // ── Listen ───────────────────────────────────────────────────────────────
 const server = app.listen(PORT, () => {
   console.log(`🚀 llmproxy on http://localhost:${PORT}`);
@@ -838,5 +1032,7 @@ const server = app.listen(PORT, () => {
   }
   console.log(`  GET  /models    /health    /api/requests    POST /v1/messages    GET /v1/models`);
 });
+
+server.on('upgrade', handleUpgrade);
 
 module.exports = { app, db, server, PROVIDERS };
