@@ -13,6 +13,8 @@
 const express = require('express');
 const Database = require('better-sqlite3');
 const crypto = require('crypto');
+const http = require('http');
+const https = require('https');
 
 const PORT = parseInt(process.env.PORT || '8181', 10);
 const DB_PATH = process.env.LLMPROXY_DB || 'requests.db';
@@ -20,18 +22,24 @@ const REQUEST_TIMEOUT = 300000; // 5 min
 
 // ── Provider registry ────────────────────────────────────────────────────
 //
-//   interface: 'anthropic' | 'openai'   determines wire shape (request body
-//                                       semantics, SSE event format, token
-//                                       field names).
-//   upstream:  full URL to forward to.
-//   path:      the local path that maps to this provider.
-//   models:    advertised by GET /models. Display only — we don't restrict.
+//   interface:         'anthropic' | 'openai'  — wire shape (SSE event
+//                      format, token field names, response-header passthrough).
+//   upstreamBase:      origin only (no path). The proxy forwards everything
+//                      after the local /<prefix>/ to the upstream.
+//   defaultPathPrefix: prepended to the post-prefix path when the client
+//                      didn't already include it. e.g. /openai/chat/completions
+//                      and /openai/v1/chat/completions both reach
+//                      api.openai.com/v1/chat/completions.
+//   aliases:           extra local prefixes that map to the same provider.
+//   canonical_path:    advertised in GET /models (display only).
+//   models:            advertised in GET /models (display only).
 const PROVIDERS = {
   claude: {
     interface: 'anthropic',
-    upstream: 'https://api.anthropic.com/v1/messages',
-    path: '/claude/v1/messages',
-    default_headers: { 'anthropic-version': '2023-06-01' },
+    upstreamBase: 'https://api.anthropic.com',
+    defaultPathPrefix: '/v1',
+    aliases: ['anthropic'],
+    canonical_path: '/v1/messages',
     models: [
       'claude-opus-4-7',
       'claude-sonnet-4-6',
@@ -41,9 +49,9 @@ const PROVIDERS = {
   },
   deepseek: {
     interface: 'openai',
-    upstream: 'https://api.deepseek.com/v1/chat/completions',
-    path: '/deepseek/v1/chat/completions',
-    default_headers: {},
+    upstreamBase: 'https://api.deepseek.com',
+    defaultPathPrefix: '',
+    canonical_path: '/v1/chat/completions',
     models: [
       'deepseek-v4-pro',
       'deepseek-v4-flash',
@@ -53,9 +61,9 @@ const PROVIDERS = {
   },
   openai: {
     interface: 'openai',
-    upstream: 'https://api.openai.com/v1/chat/completions',
-    path: '/openai/v1/chat/completions',
-    default_headers: {},
+    upstreamBase: 'https://api.openai.com',
+    defaultPathPrefix: '/v1',
+    canonical_path: '/v1/chat/completions',
     models: [
       'gpt-4o',
       'gpt-4o-mini',
@@ -70,9 +78,9 @@ const PROVIDERS = {
   // to not hit Google's native API directly.
   openrouter: {
     interface: 'openai',
-    upstream: 'https://openrouter.ai/api/v1/chat/completions',
-    path: '/openrouter/v1/chat/completions',
-    default_headers: {},
+    upstreamBase: 'https://openrouter.ai/api',
+    defaultPathPrefix: '/v1',
+    canonical_path: '/v1/chat/completions',
     models: [
       'google/gemini-2.5-flash',
       'google/gemini-2.5-pro',
@@ -80,6 +88,47 @@ const PROVIDERS = {
     ],
   },
 };
+
+// Lookup: local path's first segment → { name, config }. Includes aliases.
+const PROVIDER_BY_PREFIX = new Map();
+for (const [name, config] of Object.entries(PROVIDERS)) {
+  PROVIDER_BY_PREFIX.set(name, { name, config });
+  for (const alias of config.aliases || []) {
+    PROVIDER_BY_PREFIX.set(alias, { name, config });
+  }
+}
+
+// ── Path helpers ─────────────────────────────────────────────────────────
+function normalizePath(path) {
+  if (!path) return '/';
+  return path.startsWith('/') ? path : `/${path}`;
+}
+
+function joinUrl(base, path) {
+  return `${base.replace(/\/+$/, '')}${normalizePath(path)}`;
+}
+
+// /<prefix>/<rest> → { name, config, publicPrefix, providerPath }, or null
+// if the first segment isn't a known provider/alias.
+function stripProviderPrefix(path) {
+  const match = path.match(/^\/([^/?#]+)(\/.*)?$/);
+  if (!match) return null;
+  const entry = PROVIDER_BY_PREFIX.get(match[1].toLowerCase());
+  if (!entry) return null;
+  return {
+    ...entry,
+    publicPrefix: match[1],
+    providerPath: normalizePath(match[2] || '/'),
+  };
+}
+
+// Apply defaultPathPrefix unless the client already included it.
+function upstreamPathFor(config, providerPath) {
+  const path = normalizePath(providerPath);
+  if (!config.defaultPathPrefix || path === '/') return path;
+  if (path === config.defaultPathPrefix || path.startsWith(`${config.defaultPathPrefix}/`)) return path;
+  return `${config.defaultPathPrefix}${path}`;
+}
 
 // ── DB setup ─────────────────────────────────────────────────────────────
 const db = new Database(DB_PATH);
@@ -413,18 +462,32 @@ function parseSSE(interfaceName, sseText) {
   return { model, usage };
 }
 
-// Pick auth headers to forward to upstream.
-function buildUpstreamHeaders(provider, reqHeaders) {
-  const out = { 'Content-Type': 'application/json', ...provider.default_headers };
-  if (reqHeaders['accept-encoding']) out['Accept-Encoding'] = reqHeaders['accept-encoding'];
-  // Universal auth headers.
-  if (reqHeaders['x-api-key']) out['x-api-key'] = reqHeaders['x-api-key'];
-  if (reqHeaders['authorization']) out['authorization'] = reqHeaders['authorization'];
-  // Anthropic-specific (x-api-key already handled; pass through any other anthropic-* except version which we set).
-  if (provider.interface === 'anthropic') {
-    for (const [k, v] of Object.entries(reqHeaders)) {
-      if (k.startsWith('anthropic-') && k !== 'anthropic-version') out[k] = v;
-    }
+// Headers that must not be forwarded — hop-by-hop (RFC 7230 §6.1) plus a few
+// that Node/fetch rebuild from the body or destination (host, content-length,
+// content-encoding). Everything else — auth, content-type, anthropic-version,
+// openai-beta, anthropic-beta, custom org/project headers, future betas —
+// passes through unchanged.
+function shouldSkipHeader(header) {
+  return [
+    'connection',
+    'content-encoding',
+    'content-length',
+    'host',
+    'keep-alive',
+    'proxy-authenticate',
+    'proxy-authorization',
+    'te',
+    'trailer',
+    'transfer-encoding',
+    'upgrade',
+  ].includes(header.toLowerCase());
+}
+
+function buildUpstreamHeaders(req) {
+  const out = {};
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (shouldSkipHeader(k)) continue;
+    out[k] = v;
   }
   return out;
 }
@@ -446,10 +509,15 @@ function passthroughResponseHeaders(interfaceName) {
 }
 
 // ── Generic proxy handler ────────────────────────────────────────────────
-async function handleProxy(providerKey, req, res) {
-  const provider = PROVIDERS[providerKey];
+async function handleProxy(providerEntry, req, res) {
+  const { name: providerKey, config: provider, providerPath } = providerEntry;
   const requestId = crypto.randomBytes(8).toString('hex');
   const startTime = Date.now();
+
+  // Build the upstream URL: <base><defaultPathPrefix?><providerPath><?query>
+  const upstreamPath = upstreamPathFor(provider, providerPath);
+  const search = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
+  const upstreamUrl = joinUrl(provider.upstreamBase, upstreamPath) + search;
 
   const originalModel = req.body && req.body.model;
   const conversationId = generateConversationId(req.body && req.body.messages);
@@ -473,16 +541,23 @@ async function handleProxy(providerKey, req, res) {
     conversationId,
   );
 
-  console.log(`📥 ${providerKey} ${requestId} model=${originalModel} stream=${!!req.body.stream}`);
+  console.log(`📥 ${providerKey} ${requestId} ${req.method} ${req.path} → ${upstreamUrl} stream=${!!(req.body && req.body.stream)}`);
+
+  // express.json() leaves req.body undefined for non-POST requests and for
+  // bodies that aren't application/json. For now we only forward a body when
+  // the parser populated one — sufficient for chat-completions / messages
+  // shapes. Non-JSON bodies (file uploads, multipart) are out of scope for
+  // this phase.
+  const hasBody = req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0;
 
   let upstreamResponse;
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
-    upstreamResponse = await fetch(provider.upstream, {
-      method: 'POST',
-      headers: buildUpstreamHeaders(provider, req.headers),
-      body: JSON.stringify(req.body),
+    upstreamResponse = await fetch(upstreamUrl, {
+      method: req.method,
+      headers: buildUpstreamHeaders(req),
+      body: hasBody ? JSON.stringify(req.body) : undefined,
       signal: controller.signal,
     });
     clearTimeout(timeoutId);
@@ -499,7 +574,7 @@ async function handleProxy(providerKey, req, res) {
     if (v) res.setHeader(h, v);
   }
 
-  if (req.body.stream) {
+  if (req.body && req.body.stream) {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
@@ -570,29 +645,23 @@ app.get('/health', (_req, res) => res.json({ status: 'healthy', timestamp: new D
 app.get('/models', (_req, res) => {
   const data = [];
   for (const [key, p] of Object.entries(PROVIDERS)) {
+    const endpoint = `/${key}${p.canonical_path}`;
+    const upstream = joinUrl(p.upstreamBase, upstreamPathFor(p, p.canonical_path));
     for (const m of p.models) {
-      data.push({
-        id: m,
-        provider: key,
-        interface: p.interface,
-        endpoint: p.path,
-        upstream: p.upstream,
-      });
+      data.push({ id: m, provider: key, interface: p.interface, endpoint, upstream });
     }
   }
   res.json({ object: 'list', data });
 });
 
-app.post('/claude/v1/messages',           (req, res) => handleProxy('claude',     req, res));
-app.post('/deepseek/v1/chat/completions', (req, res) => handleProxy('deepseek',   req, res));
-app.post('/openai/v1/chat/completions',   (req, res) => handleProxy('openai',     req, res));
-app.post('/openrouter/v1/chat/completions', (req, res) => handleProxy('openrouter', req, res));
-
 // ── cproxy-compatibility aliases ─────────────────────────────────────────
 // Claude Code sets ANTHROPIC_BASE_URL=http://localhost:8181 and calls /v1/messages
 // (no namespace prefix). We forward that to the claude provider so llmproxy is a
 // drop-in replacement for cproxy. Same for /v1/models.
-app.post('/v1/messages', (req, res) => handleProxy('claude', req, res));
+app.post('/v1/messages', (req, res) => {
+  const claude = PROVIDER_BY_PREFIX.get('claude');
+  return handleProxy({ ...claude, publicPrefix: 'v1', providerPath: '/messages' }, req, res);
+});
 
 app.get('/v1/models', (_req, res) => {
   // OpenAI-compat shape — what Claude Code's /model picker expects.
@@ -734,15 +803,26 @@ app.get('/api/requests/:id/history', (req, res) => {
   }
 });
 
+// ── Generic prefix routing ───────────────────────────────────────────────
+// Catches anything under /<provider-prefix>/... that wasn't matched by an
+// explicit route above (dashboard, /health, /models, /v1/* aliases). Forwards
+// the rest of the path verbatim to the provider's upstreamBase + defaultPathPrefix.
+app.use((req, res, next) => {
+  const entry = stripProviderPrefix(req.path);
+  if (!entry) return next();
+  return handleProxy(entry, req, res);
+});
+
 // ── Listen ───────────────────────────────────────────────────────────────
 const server = app.listen(PORT, () => {
   console.log(`🚀 llmproxy on http://localhost:${PORT}`);
   console.log(`📊 db=${DB_PATH}`);
   console.log(`Routes:`);
   for (const [k, p] of Object.entries(PROVIDERS)) {
-    console.log(`  POST ${p.path}  →  ${p.upstream}  (${p.interface})`);
+    const aliases = p.aliases ? ` (aliases: ${p.aliases.map(a => '/' + a).join(', ')})` : '';
+    console.log(`  /${k}/*${aliases}  →  ${p.upstreamBase}${p.defaultPathPrefix || ''}  (${p.interface})`);
   }
-  console.log(`  GET  /models    /health    /api/requests`);
+  console.log(`  GET  /models    /health    /api/requests    POST /v1/messages    GET /v1/models`);
 });
 
 module.exports = { app, db, server, PROVIDERS };
