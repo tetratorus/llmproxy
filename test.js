@@ -675,6 +675,87 @@ async function testWebSocketFrames() {
   }
 }
 
+// ── Policy hook test ────────────────────────────────────────────────────
+// Spins up a mock hook server (returns 403 + redaction) and a mock
+// upstream (captures the body it receives), writes a temporary policy
+// file with an outbound rule matching a unique marker, reloads, then
+// posts a body containing the marker. Asserts the upstream received the
+// redaction string instead of the marker.
+async function testPolicyOutboundRedaction() {
+  const marker     = `POLICY_${process.pid}_${Date.now()}`;
+  const redaction  = `[REDACTED_${process.pid}]`;
+
+  // Mock hook server.
+  const hooks = http.createServer((req, res) => {
+    if (req.method !== 'POST' || req.url !== '/hooks/policy') { res.writeHead(404).end(); return; }
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ allow: false, redaction, reason: 'test' }));
+    });
+  });
+  await new Promise(r => hooks.listen(0, '127.0.0.1', r));
+  const hookUrl = `http://127.0.0.1:${hooks.address().port}/hooks/policy`;
+
+  // Mock upstream.
+  let upstreamBody = null;
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      upstreamBody = Buffer.concat(chunks).toString('utf8');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+  });
+  await new Promise(r => upstream.listen(0, '127.0.0.1', r));
+
+  // Temp policy file.
+  const policyPath = path.join(__dirname, `.test-policies-${process.pid}.json`);
+  fs.writeFileSync(policyPath, JSON.stringify({
+    outbound: [{ name: 'test-marker', pattern: marker, hook_url: hookUrl }],
+    inbound: [],
+  }));
+
+  const savedBase = PROVIDERS.openai.upstreamBase;
+  const savedPrefix = PROVIDERS.openai.defaultPathPrefix;
+  const savedPolicyEnv = process.env.LLM_PROXY_POLICY_FILE;
+  PROVIDERS.openai.upstreamBase = `http://127.0.0.1:${upstream.address().port}`;
+  PROVIDERS.openai.defaultPathPrefix = '';
+  process.env.LLM_PROXY_POLICY_FILE = policyPath;
+
+  try {
+    const reload = await fetch(`${BASE}/api/policies/reload`, { method: 'POST' });
+    assert(reload.ok, `reload status=${reload.status}`);
+    const reloadJson = await reload.json();
+    assert(reloadJson.outbound === 1, `outbound rules=${reloadJson.outbound} (expected 1)`);
+
+    const r = await fetch(`${BASE}/openai/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'test', messages: [{ role: 'user', content: marker }] }),
+    });
+    assert(r.ok, `proxy status=${r.status}`);
+    assert(upstreamBody,                                  'upstream got no body');
+    assert(!upstreamBody.includes(marker),                `marker leaked: ${upstreamBody.slice(0, 200)}`);
+    assert(upstreamBody.includes(redaction),              `redaction missing: ${upstreamBody.slice(0, 200)}`);
+
+    record('policy: outbound rule denial replaces matched body with redaction', 'PASS');
+  } finally {
+    PROVIDERS.openai.upstreamBase = savedBase;
+    PROVIDERS.openai.defaultPathPrefix = savedPrefix;
+    if (savedPolicyEnv === undefined) delete process.env.LLM_PROXY_POLICY_FILE;
+    else process.env.LLM_PROXY_POLICY_FILE = savedPolicyEnv;
+    try { fs.unlinkSync(policyPath); } catch (_) {}
+    if (typeof upstream.closeAllConnections === 'function') upstream.closeAllConnections();
+    if (typeof hooks.closeAllConnections === 'function') hooks.closeAllConnections();
+    upstream.close();
+    hooks.close();
+    // Reload to clear the policy.
+    await fetch(`${BASE}/api/policies/reload`, { method: 'POST' });
+  }
+}
+
 // ── Runner ──────────────────────────────────────────────────────────────
 async function main() {
   await waitHealthy();
@@ -695,6 +776,7 @@ async function main() {
     ['dashboard',  testDashboard],
     ['dashboard',  testDashboardNavigation],
     ['websocket',  testWebSocketFrames],
+    ['policy',     testPolicyOutboundRedaction],
   ];
 
   for (const [tag, fn] of all) {

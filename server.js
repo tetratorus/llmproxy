@@ -13,8 +13,11 @@
 const express = require('express');
 const Database = require('better-sqlite3');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const http = require('http');
 const https = require('https');
+const toml = require('smol-toml');
 
 const PORT = parseInt(process.env.PORT || '8181', 10);
 const DB_PATH = process.env.LLMPROXY_DB || 'requests.db';
@@ -22,6 +25,10 @@ const REQUEST_TIMEOUT = 300000; // 5 min
 // chars of payload context to surface around each search-matched WS frame snippet
 const WEBSOCKET_SEARCH_SNIPPET_LIMIT = parseInt(process.env.WEBSOCKET_SEARCH_SNIPPET_LIMIT_CHARS || '500', 10);
 const BODY_LIMIT_BYTES = 50 * 1024 * 1024;
+const POLICY_FILE = process.env.LLM_PROXY_POLICY_FILE || 'policies.toml';
+const POLICY_HOOK_URL = process.env.LLM_PROXY_POLICY_HOOK_URL || 'http://127.0.0.1:8888/hooks/policy';
+const POLICY_HOOK_TIMEOUT = parseInt(process.env.LLM_PROXY_POLICY_HOOK_TIMEOUT_MS || '60000', 10);
+const HOOK_DECISION_CACHE_TTL_MS = parseInt(process.env.HOOK_DECISION_CACHE_TTL_MS || '3600000', 10);
 
 // ── Provider registry ────────────────────────────────────────────────────
 //
@@ -406,6 +413,123 @@ function createWebSocketFrameParser(onFrame) {
   };
 }
 
+// ── Policy hooks (regex match → out-of-band approval) ───────────────────
+// Two regex sets — `outbound` runs over every request body before forwarding,
+// `inbound` runs over every response body before returning to the client.
+// Each rule has { name, pattern, flags?, hook_url? }. On match, the proxy
+// POSTs { rule, text, offending_text } to hook_url and waits for a JSON
+// decision: 200 { allow: true } forwards as-is, 403 { allow: false, redaction }
+// substitutes the redaction string for the matched text. Hook unreachable
+// or timeout defaults to allow — fail-open so a downed approver doesn't
+// brick the proxy. Decisions are cached by (rule.name, offending_text)
+// for HOOK_DECISION_CACHE_TTL_MS so repeated traffic isn't re-prompted.
+let POLICY_RULES = { outbound: [], inbound: [] };
+const HOOK_DECISION_CACHE = new Map();
+
+function loadPolicyFile() {
+  // Re-read the env var on every reload so tests (and live edits) can
+  // point at different policy files without restarting the proxy.
+  const filePath = path.resolve(process.env.LLM_PROXY_POLICY_FILE || POLICY_FILE);
+  if (!fs.existsSync(filePath)) return { outbound: [], inbound: [] };
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const parsed = filePath.endsWith('.json') ? JSON.parse(raw) : toml.parse(raw);
+    return {
+      outbound: Array.isArray(parsed.outbound) ? parsed.outbound : [],
+      inbound:  Array.isArray(parsed.inbound)  ? parsed.inbound  : [],
+    };
+  } catch (e) {
+    console.warn(`policy file ${filePath} parse error:`, e.message);
+    return { outbound: [], inbound: [] };
+  }
+}
+
+function compileRules(rules) {
+  return rules.map(r => {
+    try {
+      return {
+        name: r.name || '',
+        regex: new RegExp(r.pattern, r.flags || ''),
+        hook_url: r.hook_url || POLICY_HOOK_URL,
+      };
+    } catch (e) {
+      console.warn(`policy rule ${r.name} regex compile error:`, e.message);
+      return null;
+    }
+  }).filter(Boolean);
+}
+
+function reloadPolicies() {
+  const cfg = loadPolicyFile();
+  POLICY_RULES = {
+    outbound: compileRules(cfg.outbound),
+    inbound:  compileRules(cfg.inbound),
+  };
+  HOOK_DECISION_CACHE.clear();
+  console.log(`📋 policies loaded: ${POLICY_RULES.outbound.length} outbound, ${POLICY_RULES.inbound.length} inbound`);
+}
+reloadPolicies();
+
+// Watch for policies.toml changes so editing the file hot-reloads (no proxy
+// restart needed). Falls through silently if the file doesn't exist yet.
+try {
+  fs.watch(path.resolve(POLICY_FILE), { persistent: false }, () => {
+    setTimeout(reloadPolicies, 100);
+  });
+} catch (_) {}
+
+// Call the hook server, with caching keyed by (rule, offending_text).
+// Returns { allow: bool, redaction?: string }.
+async function callPolicyHook(rule, text, offendingText) {
+  const cacheKey = `${rule.name}\x00${offendingText}`;
+  const cached = HOOK_DECISION_CACHE.get(cacheKey);
+  if (cached && (Date.now() - cached.t) < HOOK_DECISION_CACHE_TTL_MS) return cached.decision;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), POLICY_HOOK_TIMEOUT);
+  let decision = { allow: true };
+  try {
+    const r = await fetch(rule.hook_url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        rule: { name: rule.name, pattern: rule.regex.source, flags: rule.regex.flags },
+        text,
+        offending_text: offendingText,
+      }),
+      signal: controller.signal,
+    });
+    const body = await r.json().catch(() => ({}));
+    if (r.status === 200 && body.allow !== false) decision = { allow: true };
+    else if (r.status === 403 && body.allow === false) decision = { allow: false, redaction: body.redaction || '' };
+    else decision = { allow: body.allow !== false }; // permissive fallback
+  } catch (err) {
+    console.warn(`hook ${rule.name} error: ${err.message} — defaulting to allow`);
+    decision = { allow: true };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+  HOOK_DECISION_CACHE.set(cacheKey, { decision, t: Date.now() });
+  return decision;
+}
+
+// Walk the rule set against `text`. For each match, either allow (via hook
+// 200) or redact (replace the offending substring with the hook's redaction
+// string). Returns the possibly-modified text.
+async function evaluatePolicies(rules, text) {
+  if (!rules.length || !text) return text;
+  let current = text;
+  for (const rule of rules) {
+    const m = current.match(rule.regex);
+    if (!m) continue;
+    const offending = m[0];
+    const decision = await callPolicyHook(rule, current, offending);
+    if (decision.allow) continue;
+    current = current.split(offending).join(decision.redaction || '');
+  }
+  return current;
+}
+
 // ── App setup ────────────────────────────────────────────────────────────
 const app = express();
 
@@ -665,6 +789,14 @@ async function handleProxy(providerEntry, req, res) {
     upstreamHeaders['content-encoding'] = req.headers['content-encoding'];
   }
 
+  // Outbound policy evaluation. Only over text-shaped bodies for now; binary
+  // (Buffer) and absent bodies bypass. If the hook denies, the body sent
+  // upstream gets the redaction substituted in.
+  let outgoingBody = buildUpstreamBody(req);
+  if (typeof outgoingBody === 'string' && POLICY_RULES.outbound.length) {
+    outgoingBody = await evaluatePolicies(POLICY_RULES.outbound, outgoingBody);
+  }
+
   let upstreamResponse;
   try {
     const controller = new AbortController();
@@ -672,7 +804,7 @@ async function handleProxy(providerEntry, req, res) {
     upstreamResponse = await fetch(upstreamUrl, {
       method: req.method,
       headers: upstreamHeaders,
-      body: buildUpstreamBody(req),
+      body: outgoingBody,
       signal: controller.signal,
     });
     clearTimeout(timeoutId);
@@ -734,7 +866,13 @@ async function handleProxy(providerEntry, req, res) {
   }
 
   // Non-streaming.
-  const responseText = await upstreamResponse.text();
+  let responseText = await upstreamResponse.text();
+  // Inbound policy evaluation. Hook can redact text in the response
+  // before we forward it to the client. (Streaming responses are not
+  // evaluated yet — frame-/chunk-level inbound is a follow-up phase.)
+  if (POLICY_RULES.inbound.length) {
+    responseText = await evaluatePolicies(POLICY_RULES.inbound, responseText);
+  }
   const elapsed = Date.now() - startTime;
   let parsedBody = null;
   try { parsedBody = JSON.parse(responseText); } catch (_) {}
@@ -973,6 +1111,14 @@ app.get('/api/requests/:id/history', (req, res) => {
     console.error('GET /api/requests/:id/history error:', e);
     res.status(500).json({ error: 'Failed to get history' });
   }
+});
+
+// Hot-reload policies.toml without restarting the proxy. Useful for
+// tweaking rules during development; fs.watch above already reloads on
+// file change, but this is the explicit trigger.
+app.post('/api/policies/reload', (_req, res) => {
+  reloadPolicies();
+  res.json({ outbound: POLICY_RULES.outbound.length, inbound: POLICY_RULES.inbound.length });
 });
 
 // Paginated WebSocket frame log for a given request. Returned in sequence

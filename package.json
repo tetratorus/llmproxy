@@ -13,12 +13,20 @@
     "test:openrouter": "node test.js openrouter",
     "test:models": "node test.js models",
     "test:dashboard": "node test.js dashboard",
-    "test:websocket": "node test.js websocket"
+    "test:websocket": "node test.js websocket",
+    "test:policy": "node test.js policy"
   },
-  "keywords": ["llm", "proxy", "anthropic", "deepseek", "observability"],
+  "keywords": [
+    "llm",
+    "proxy",
+    "anthropic",
+    "deepseek",
+    "observability"
+  ],
   "license": "ISC",
   "dependencies": {
     "better-sqlite3": "^12.4.1",
-    "express": "^5.1.0"
+    "express": "^5.1.0",
+    "smol-toml": "^1.6.1"
   }
 }
