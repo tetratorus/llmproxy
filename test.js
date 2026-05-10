@@ -756,6 +756,79 @@ async function testPolicyOutboundRedaction() {
   }
 }
 
+// ── Agent namespace test ────────────────────────────────────────────────
+// Verifies the /<agent>/<provider>/<path> disambiguation: an unknown first
+// segment that matches AGENT_RE and is followed by a known provider is
+// routed as agent=<first> + provider=<second>, the row carries the agent
+// column, /api/requests?agent=<name> filters it, and /api/agents lists it.
+async function testAgentNamespace() {
+  const agent  = `testbot_${process.pid.toString().padStart(5, '0')}`.slice(0, 32);
+  const marker = `AGENTKW_${process.pid}_${Date.now()}`;
+
+  // Mock upstream that captures forwarded body and 200s back.
+  let upstreamBody = null;
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      upstreamBody = Buffer.concat(chunks).toString('utf8');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+  });
+  await new Promise(r => upstream.listen(0, '127.0.0.1', r));
+
+  const savedBase = PROVIDERS.openai.upstreamBase;
+  const savedPrefix = PROVIDERS.openai.defaultPathPrefix;
+  PROVIDERS.openai.upstreamBase = `http://127.0.0.1:${upstream.address().port}`;
+  PROVIDERS.openai.defaultPathPrefix = '';
+
+  try {
+    // 1. Agent-namespaced route resolves and persists agent.
+    const r = await fetch(`${BASE}/${agent}/openai/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'test', messages: [{ role: 'user', content: marker }] }),
+    });
+    assert(r.ok,                                      `agent route status=${r.status}`);
+    assert(upstreamBody && upstreamBody.includes(marker), 'upstream did not receive forwarded body');
+
+    const row = db.prepare(`SELECT id, provider, agent, endpoint FROM requests WHERE agent = ? ORDER BY rowid DESC LIMIT 1`).get(agent);
+    assert(row,                                       'no row stored for agent-namespaced request');
+    assert(row.provider === 'openai',                 `provider=${row.provider} (expected openai)`);
+    assert(row.agent === agent,                       `agent=${row.agent} (expected ${agent})`);
+    assert(row.endpoint === `/${agent}/openai/chat/completions`, `endpoint=${row.endpoint}`);
+
+    // 2. Unknown first segment that does NOT match AGENT_RE → 404 (too short).
+    const r2 = await fetch(`${BASE}/x/openai/chat/completions`, { method: 'POST' });
+    assert(r2.status === 404,                         `short first-seg status=${r2.status} (expected 404)`);
+
+    // 3. AGENT_RE-shaped first segment but second segment isn't a provider → 404.
+    const r3 = await fetch(`${BASE}/${agent}/notaprovider/foo`, { method: 'POST' });
+    assert(r3.status === 404,                         `bogus second-seg status=${r3.status} (expected 404)`);
+
+    // 4. /api/agents lists the agent.
+    const ag = await fetch(`${BASE}/api/agents`);
+    assert(ag.ok, `/api/agents status=${ag.status}`);
+    const agJ = await ag.json();
+    assert(Array.isArray(agJ) && agJ.includes(agent), `/api/agents missing ${agent}: ${JSON.stringify(agJ)}`);
+
+    // 5. /api/requests?agent=<name> filters to that agent.
+    const lr = await fetch(`${BASE}/api/requests?agent=${encodeURIComponent(agent)}&limit=10`);
+    assert(lr.ok, `requests-by-agent status=${lr.status}`);
+    const lj = await lr.json();
+    assert(lj.total >= 1,                             `agent filter total=${lj.total}`);
+    assert(lj.requests.every(r => r.agent === agent), 'agent filter returned other rows');
+
+    record('agent: namespaced route + agent filter + /api/agents listing', 'PASS', `agent=${agent}`);
+  } finally {
+    PROVIDERS.openai.upstreamBase = savedBase;
+    PROVIDERS.openai.defaultPathPrefix = savedPrefix;
+    if (typeof upstream.closeAllConnections === 'function') upstream.closeAllConnections();
+    upstream.close();
+  }
+}
+
 // ── Runner ──────────────────────────────────────────────────────────────
 async function main() {
   await waitHealthy();
@@ -777,6 +850,7 @@ async function main() {
     ['dashboard',  testDashboardNavigation],
     ['websocket',  testWebSocketFrames],
     ['policy',     testPolicyOutboundRedaction],
+    ['agent',      testAgentNamespace],
   ];
 
   for (const [tag, fn] of all) {

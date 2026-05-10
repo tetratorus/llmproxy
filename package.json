@@ -14,7 +14,8 @@
     "test:models": "node test.js models",
     "test:dashboard": "node test.js dashboard",
     "test:websocket": "node test.js websocket",
-    "test:policy": "node test.js policy"
+    "test:policy": "node test.js policy",
+    "test:agent": "node test.js agent"
   },
   "keywords": [
     "llm",
