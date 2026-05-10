@@ -1003,11 +1003,27 @@ app.get('/api/requests', (req, res) => {
 
     const parsed = rows.map(r => {
       try {
+        let bodyObj = null;
+        if (r.body) {
+          bodyObj = JSON.parse(r.body);
+          // Trim system prompt in list view (first 200 chars of first message content)
+          if (bodyObj && bodyObj.messages && bodyObj.messages.length > 0) {
+            const first = bodyObj.messages[0].content;
+            if (typeof first === 'string' && first.length > 200) {
+              bodyObj = { messages: [{ role: bodyObj.messages[0].role, content: first.slice(0, 200) + '…' }], _truncated: true, _original_msgs: bodyObj.messages.length };
+            }
+          }
+        }
+        let respObj = null;
+        if (r.response) {
+          // Only keep first 500 chars of response for list view
+          respObj = r.response.length > 500 ? r.response.slice(0, 500) + '…' : r.response;
+        }
         return {
           ...r,
           headers:  r.headers ? JSON.parse(r.headers) : null,
-          body:     r.body ? JSON.parse(r.body) : null,
-          response: parseStoredResponse(r.response),
+          body:     bodyObj,
+          response: respObj,
           message_count: r.message_count || 0,
           websocket_frame_count: r.websocket_frame_count || 0,
           websocket_matches: r.websocket_matches ? JSON.parse(r.websocket_matches) : null,

@@ -473,7 +473,7 @@
 <body x-data="appState" x-init="init()">
   <div class="container">
     <header>
-      <h1>Claude Request Explorer</h1>
+      <h1>LLM Request Explorer</h1>
       <div class="header-controls">
         <button @click="toggleDarkMode()">🌓 Dark Mode</button>
         <button @click="loadRequests(currentPage)">🔄 Refresh</button>
@@ -514,7 +514,7 @@
         },
 
         // Initialize
-        init() {
+        async init() {
           app = this;
 
           // Check for dark mode preference
