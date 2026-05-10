@@ -21,6 +21,7 @@ const DB_PATH = process.env.LLMPROXY_DB || 'requests.db';
 const REQUEST_TIMEOUT = 300000; // 5 min
 // chars of payload context to surface around each search-matched WS frame snippet
 const WEBSOCKET_SEARCH_SNIPPET_LIMIT = parseInt(process.env.WEBSOCKET_SEARCH_SNIPPET_LIMIT_CHARS || '500', 10);
+const BODY_LIMIT_BYTES = 50 * 1024 * 1024;
 
 // ── Provider registry ────────────────────────────────────────────────────
 //
@@ -407,6 +408,31 @@ function createWebSocketFrameParser(onFrame) {
 
 // ── App setup ────────────────────────────────────────────────────────────
 const app = express();
+
+// zstd / zst content-encoding passthrough. Node's express.json/text/raw
+// don't know how to decompress zstd, so without this middleware those
+// requests would silently fall through with req.body undefined. We intercept
+// before any body parser, capture the raw bytes, and let the rest of the
+// pipeline see a Buffer — which buildUpstreamBody forwards verbatim.
+function readUnsupportedEncodedBody(req, res, next) {
+  const enc = String(req.headers['content-encoding'] || '').toLowerCase().trim();
+  if (!['zstd', 'zst'].includes(enc)) return next();
+  const chunks = [];
+  let size = 0;
+  req.on('data', chunk => {
+    size += chunk.length;
+    if (size > BODY_LIMIT_BYTES) {
+      res.status(413).json({ error: 'Request body too large' });
+      req.destroy();
+      return;
+    }
+    chunks.push(chunk);
+  });
+  req.on('end', () => { req.body = Buffer.concat(chunks); next(); });
+  req.on('error', next);
+}
+app.use(readUnsupportedEncodedBody);
+
 // Type-aware body parsers, in priority order. Each only handles its declared
 // content-types; anything else falls through to the next. `express.raw`
 // catches binary uploads (multipart, audio, video, PDFs) so they reach
@@ -630,13 +656,22 @@ async function handleProxy(providerEntry, req, res) {
 
   console.log(`📥 ${providerKey} ${requestId} ${req.method} ${req.path} → ${upstreamUrl} stream=${!!(isObjectBody && req.body.stream)}`);
 
+  // Headers: denylist drops content-encoding by default (because we
+  // re-stringify JSON, the resulting bytes are no longer encoded). For
+  // Buffer bodies (raw passthrough including zstd uploads) the bytes
+  // match the original encoding, so we restore the client's value.
+  const upstreamHeaders = buildUpstreamHeaders(req);
+  if (Buffer.isBuffer(req.body) && req.headers['content-encoding']) {
+    upstreamHeaders['content-encoding'] = req.headers['content-encoding'];
+  }
+
   let upstreamResponse;
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
     upstreamResponse = await fetch(upstreamUrl, {
       method: req.method,
-      headers: buildUpstreamHeaders(req),
+      headers: upstreamHeaders,
       body: buildUpstreamBody(req),
       signal: controller.signal,
     });
