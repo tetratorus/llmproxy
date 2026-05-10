@@ -73,6 +73,20 @@ const PROVIDERS = {
       'o1-mini',
     ],
   },
+  // codex CLI authed via ChatGPT browser session (`codex login`) talks to
+  // chatgpt.com/backend-api/codex/<endpoint> — different host, different auth
+  // (OAuth bearer, not OPENAI_API_KEY). Wire it as its own provider so traffic
+  // through `model_provider.base_url=http://localhost:8181/codex` lands on the
+  // ChatGPT backend instead of api.openai.com. Interface is tagged 'codex' so
+  // the openai-shape token extractor doesn't silently produce zero tokens
+  // against the Responses-API usage shape.
+  codex: {
+    interface: 'codex',
+    upstreamBase: 'https://chatgpt.com',
+    defaultPathPrefix: '/backend-api/codex',
+    canonical_path: '/responses',
+    models: [],
+  },
   // OpenRouter aggregates many model providers behind one OpenAI-shaped endpoint.
   // We use this for Gemini (model id = "google/gemini-2.5-flash" etc.) per project decision
   // to not hit Google's native API directly.
