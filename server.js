@@ -87,6 +87,27 @@ const PROVIDERS = {
     canonical_path: '/responses',
     models: [],
   },
+  // Google Gemini direct (generativelanguage.googleapis.com). The /upload/
+  // path is outside the /v1beta prefix — it's a multipart-upload endpoint
+  // for files referenced by later /v1beta calls. absolutePathPrefixes lets
+  // /gemini/upload/... bypass the defaultPathPrefix prepend.
+  gemini: {
+    interface: 'gemini',
+    upstreamBase: 'https://generativelanguage.googleapis.com',
+    defaultPathPrefix: '/v1beta',
+    aliases: ['google'],
+    absolutePathPrefixes: ['/upload/'],
+    canonical_path: '/v1beta/models',
+    models: ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.0-flash-001'],
+  },
+  xai: {
+    interface: 'openai',
+    upstreamBase: 'https://api.x.ai',
+    defaultPathPrefix: '/v1',
+    aliases: ['grok'],
+    canonical_path: '/v1/chat/completions',
+    models: ['grok-4', 'grok-4-mini', 'grok-3', 'grok-2'],
+  },
   // OpenRouter aggregates many model providers behind one OpenAI-shaped endpoint.
   // We use this for Gemini (model id = "google/gemini-2.5-flash" etc.) per project decision
   // to not hit Google's native API directly.
@@ -137,8 +158,12 @@ function stripProviderPrefix(path) {
 }
 
 // Apply defaultPathPrefix unless the client already included it.
+// absolutePathPrefixes: paths that should bypass the defaultPathPrefix and
+// reach the upstream root verbatim (e.g. Gemini's /upload/v1beta/files
+// multipart upload, which lives outside the /v1beta API prefix).
 function upstreamPathFor(config, providerPath) {
   const path = normalizePath(providerPath);
+  if ((config.absolutePathPrefixes || []).some(prefix => path.startsWith(prefix))) return path;
   if (!config.defaultPathPrefix || path === '/') return path;
   if (path === config.defaultPathPrefix || path.startsWith(`${config.defaultPathPrefix}/`)) return path;
   return `${config.defaultPathPrefix}${path}`;
