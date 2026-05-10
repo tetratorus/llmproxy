@@ -224,8 +224,10 @@ db.exec(`
   if (!cols.includes('provider'))     { db.exec(`ALTER TABLE requests ADD COLUMN provider  TEXT DEFAULT 'claude'`);    console.log(`📦 added column: provider  (default=claude)`); }
   if (!cols.includes('interface'))    { db.exec(`ALTER TABLE requests ADD COLUMN interface TEXT DEFAULT 'anthropic'`); console.log(`📦 added column: interface (default=anthropic)`); }
   if (!cols.includes('upstream_url')) { db.exec(`ALTER TABLE requests ADD COLUMN upstream_url TEXT`);                  console.log(`📦 added column: upstream_url`); }
+  if (!cols.includes('agent'))        { db.exec(`ALTER TABLE requests ADD COLUMN agent TEXT`);                         console.log(`📦 added column: agent`); }
 }
 db.exec(`CREATE INDEX IF NOT EXISTS idx_provider ON requests(provider);`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_agent ON requests(agent);`);
 
 // WebSocket frame log. Wired by the upgrade handler in a later phase; the table
 // is created up-front so adding the handler later is a code-only change with no
@@ -740,8 +742,13 @@ function passthroughResponseHeaders(interfaceName) {
   ];
 }
 
+// Bot-username validator: Telegram allows letters/digits/underscores, 5-32 chars,
+// must end in 'bot'. We only enforce shape here; collisions are impossible because
+// Telegram itself enforces global uniqueness.
+const AGENT_RE = /^[A-Za-z0-9_]{5,32}$/;
+
 // ── Generic proxy handler ────────────────────────────────────────────────
-async function handleProxy(providerEntry, req, res) {
+async function handleProxy(providerEntry, req, res, agent = null) {
   const { name: providerKey, config: provider, providerPath } = providerEntry;
   const requestId = crypto.randomBytes(8).toString('hex');
   const startTime = Date.now();
@@ -760,8 +767,8 @@ async function handleProxy(providerEntry, req, res) {
 
   db.prepare(`
     INSERT INTO requests (id, provider, interface, method, endpoint, headers, body,
-                          original_model, routed_model, user_agent, content_type, session_id, upstream_url)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          original_model, routed_model, user_agent, content_type, session_id, upstream_url, agent)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     requestId,
     providerKey,
@@ -776,9 +783,11 @@ async function handleProxy(providerEntry, req, res) {
     req.headers['content-type'] || null,
     conversationId,
     upstreamUrl,
+    agent,
   );
 
-  console.log(`📥 ${providerKey} ${requestId} ${req.method} ${req.path} → ${upstreamUrl} stream=${!!(isObjectBody && req.body.stream)}`);
+  const agentTag = agent ? ` agent=${agent}` : '';
+  console.log(`📥 ${providerKey} ${requestId}${agentTag} ${req.method} ${req.path} → ${upstreamUrl} stream=${!!(isObjectBody && req.body.stream)}`);
 
   // Headers: denylist drops content-encoding by default (because we
   // re-stringify JSON, the resulting bytes are no longer encoded). For
@@ -935,67 +944,63 @@ app.get('/api/requests', (req, res) => {
     const limit  = parseInt(req.query.limit) || 50;
     const offset = (page - 1) * limit;
     const search = String(req.query.search || '').trim();
+    const agent  = String(req.query.agent  || '').trim();
+    // Build WHERE clauses dynamically so the same query handles all four
+    // combinations (search × agent). LIKE search covers endpoint/provider/
+    // model/body/response and reaches into websocket_frames.payload via an
+    // EXISTS subquery — that's what makes WS rows (codex, realtime audio)
+    // findable from the dashboard.
     let total, rows;
+    const whereParts = [];
+    const whereParams = [];
+    let like = null;
     if (search) {
-      // LIKE-based search across the request envelope (endpoint, provider,
-      // model, body, response) AND any matching frame payload via EXISTS.
-      // Replaces the FTS5-only search so WebSocket frames — where codex,
-      // realtime audio, and any other WS-shaped traffic actually lives —
-      // are findable from the dashboard.
-      const like = `%${search}%`;
-      ({ total } = db.prepare(`
-        SELECT COUNT(*) as total FROM requests
-        WHERE endpoint LIKE ? OR provider LIKE ? OR model LIKE ?
-           OR body LIKE ? OR response LIKE ?
-           OR EXISTS (
-             SELECT 1 FROM websocket_frames
-             WHERE websocket_frames.request_id = requests.id
-               AND websocket_frames.payload LIKE ?
-           )
-      `).get(like, like, like, like, like, like));
-      rows = db.prepare(`
-        SELECT
-          requests.*,
-          json_array_length(json_extract(body, '$.messages')) AS message_count,
-          (SELECT COUNT(*) FROM websocket_frames WHERE websocket_frames.request_id = requests.id) AS websocket_frame_count,
-          (
-            SELECT json_group_array(json_object(
-              'sequence', sequence,
-              'timestamp', timestamp,
-              'direction', direction,
-              'type', type,
-              'bytes', bytes,
-              'snippet', substr(payload, max(1, instr(payload, ?) - 160), ?)
-            ))
-            FROM (
-              SELECT sequence, timestamp, direction, type, bytes, payload
-              FROM websocket_frames
-              WHERE websocket_frames.request_id = requests.id AND payload LIKE ?
-              ORDER BY sequence
-              LIMIT 5
-            )
-          ) AS websocket_matches
-        FROM requests
-        WHERE endpoint LIKE ? OR provider LIKE ? OR model LIKE ?
-           OR body LIKE ? OR response LIKE ?
-           OR EXISTS (
-             SELECT 1 FROM websocket_frames
-             WHERE websocket_frames.request_id = requests.id
-               AND websocket_frames.payload LIKE ?
-           )
-        ORDER BY timestamp DESC LIMIT ? OFFSET ?
-      `).all(search, WEBSOCKET_SEARCH_SNIPPET_LIMIT, like, like, like, like, like, like, like, limit, offset);
-    } else {
-      ({ total } = db.prepare(`SELECT COUNT(*) as total FROM requests`).get());
-      rows = db.prepare(`
-        SELECT
-          requests.*,
-          json_array_length(json_extract(body, '$.messages')) AS message_count,
-          (SELECT COUNT(*) FROM websocket_frames WHERE websocket_frames.request_id = requests.id) AS websocket_frame_count,
-          NULL AS websocket_matches
-        FROM requests ORDER BY timestamp DESC LIMIT ? OFFSET ?
-      `).all(limit, offset);
+      like = `%${search}%`;
+      whereParts.push(`(endpoint LIKE ? OR provider LIKE ? OR model LIKE ?
+          OR body LIKE ? OR response LIKE ?
+          OR EXISTS (
+            SELECT 1 FROM websocket_frames
+            WHERE websocket_frames.request_id = requests.id
+              AND websocket_frames.payload LIKE ?
+          ))`);
+      whereParams.push(like, like, like, like, like, like);
     }
+    if (agent) {
+      whereParts.push(`requests.agent = ?`);
+      whereParams.push(agent);
+    }
+    const where = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+
+    ({ total } = db.prepare(`SELECT COUNT(*) as total FROM requests ${where}`).get(...whereParams));
+
+    // Frame snippet column only when there's a search term; otherwise NULL.
+    const matchesCol = search
+      ? `(
+          SELECT json_group_array(json_object(
+            'sequence', sequence, 'timestamp', timestamp, 'direction', direction,
+            'type', type, 'bytes', bytes,
+            'snippet', substr(payload, max(1, instr(payload, ?) - 160), ?)
+          ))
+          FROM (
+            SELECT sequence, timestamp, direction, type, bytes, payload
+            FROM websocket_frames
+            WHERE websocket_frames.request_id = requests.id AND payload LIKE ?
+            ORDER BY sequence LIMIT 5
+          )
+        ) AS websocket_matches`
+      : `NULL AS websocket_matches`;
+
+    const selectParams = search ? [search, WEBSOCKET_SEARCH_SNIPPET_LIMIT, like] : [];
+    rows = db.prepare(`
+      SELECT
+        requests.*,
+        json_array_length(json_extract(body, '$.messages')) AS message_count,
+        (SELECT COUNT(*) FROM websocket_frames WHERE websocket_frames.request_id = requests.id) AS websocket_frame_count,
+        ${matchesCol}
+      FROM requests ${where}
+      ORDER BY timestamp DESC LIMIT ? OFFSET ?
+    `).all(...selectParams, ...whereParams, limit, offset);
+
     const parsed = rows.map(r => {
       try {
         return {
@@ -1013,6 +1018,16 @@ app.get('/api/requests', (req, res) => {
   } catch (e) {
     console.error('GET /api/requests error:', e);
     res.status(500).json({ error: 'Failed to get requests' });
+  }
+});
+
+// List distinct agents (from request log, live)
+app.get('/api/agents', (_req, res) => {
+  try {
+    const rows = db.prepare('SELECT DISTINCT agent FROM requests WHERE agent IS NOT NULL ORDER BY agent').all();
+    res.json(rows.map(r => r.agent));
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to list agents', detail: e.message });
   }
 });
 
@@ -1113,6 +1128,17 @@ app.get('/api/requests/:id/history', (req, res) => {
   }
 });
 
+// Distinct agent names from the request log. Powers the dashboard's per-agent
+// dropdown filter. Live — no caching.
+app.get('/api/agents', (_req, res) => {
+  try {
+    const rows = db.prepare(`SELECT DISTINCT agent FROM requests WHERE agent IS NOT NULL ORDER BY agent`).all();
+    res.json(rows.map(r => r.agent));
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to list agents', detail: e.message });
+  }
+});
+
 // Hot-reload policies.toml without restarting the proxy. Useful for
 // tweaking rules during development; fs.watch above already reloads on
 // file change, but this is the explicit trigger.
@@ -1145,13 +1171,28 @@ app.get('/api/requests/:id/websocket-frames', (req, res) => {
 });
 
 // ── Generic prefix routing ───────────────────────────────────────────────
-// Catches anything under /<provider-prefix>/... that wasn't matched by an
-// explicit route above (dashboard, /health, /models, /v1/* aliases). Forwards
-// the rest of the path verbatim to the provider's upstreamBase + defaultPathPrefix.
+// Two shapes accepted:
+//   /<provider>/<rest>           → no agent attribution
+//   /<agent>/<provider>/<rest>   → agent stored on the row
+// The disambiguation is purely structural: try first segment as provider; if
+// that fails AND first segment matches AGENT_RE AND second segment IS a
+// known provider, treat first segment as agent. Anything else falls through
+// to the default 404. Provider names never collide with Telegram-shaped agent
+// names by construction (provider names are short lowercase, agents are
+// 5–32 chars including the `_bot` suffix).
 app.use((req, res, next) => {
-  const entry = stripProviderPrefix(req.path);
+  let entry = stripProviderPrefix(req.path);
+  let agent = null;
+  if (!entry) {
+    const segs = req.path.split('/').filter(Boolean);
+    if (segs.length >= 2 && AGENT_RE.test(segs[0])) {
+      const innerPath = '/' + segs.slice(1).join('/');
+      const innerEntry = stripProviderPrefix(innerPath);
+      if (innerEntry) { entry = innerEntry; agent = segs[0]; }
+    }
+  }
   if (!entry) return next();
-  return handleProxy(entry, req, res);
+  return handleProxy(entry, req, res, agent);
 });
 
 // ── WebSocket upgrade handler ────────────────────────────────────────────
