@@ -150,19 +150,23 @@ async function testHealthAndModels() {
   const deepseekEntry   = mj.data.find(d => d.id === 'deepseek-v4-pro');
   const openaiEntry     = mj.data.find(d => d.id === 'gpt-4o-mini');
   const openrouterEntry = mj.data.find(d => d.id === 'google/gemini-2.5-flash');
+  const kimiEntry       = mj.data.find(d => d.id === 'kimi-k2.6');
   assert(claudeEntry,     'claude-opus-4-7 not in /models');
   assert(deepseekEntry,   'deepseek-v4-pro not in /models');
   assert(openaiEntry,     'gpt-4o-mini not in /models');
   assert(openrouterEntry, 'google/gemini-2.5-flash not in /models');
+  assert(kimiEntry,       'kimi-k2.6 not in /models');
   assert(claudeEntry.interface === 'anthropic',     'claude not tagged anthropic');
   assert(deepseekEntry.interface === 'openai',      'deepseek not tagged openai');
   assert(openaiEntry.interface === 'openai',        'openai not tagged openai');
   assert(openrouterEntry.interface === 'openai',    'openrouter not tagged openai');
+  assert(kimiEntry.interface === 'openai',          'kimi not tagged openai');
   assert(claudeEntry.endpoint === '/claude/v1/messages',                   'claude endpoint wrong');
   assert(deepseekEntry.endpoint === '/deepseek/v1/chat/completions',       'deepseek endpoint wrong');
   assert(openaiEntry.endpoint === '/openai/v1/chat/completions',           'openai endpoint wrong');
   assert(openrouterEntry.endpoint === '/openrouter/v1/chat/completions',   'openrouter endpoint wrong');
-  record('models: lists claude+deepseek+openai+openrouter with correct interface and endpoint', 'PASS');
+  assert(kimiEntry.endpoint === '/kimi/v1/chat/completions',               'kimi endpoint wrong');
+  record('models: lists claude+deepseek+openai+openrouter+kimi with correct interface and endpoint', 'PASS');
 
   // /v1/models alias (cproxy-compat): Anthropic-only OpenAI-shape list for the Claude Code picker.
   const v1m = await fetch(`${BASE}/v1/models`);
@@ -417,6 +421,74 @@ async function testOpenaiStreaming() {
   assert(row.input_tokens > 0,          `streamed input_tokens=${row.input_tokens}`);
   assert(row.output_tokens > 0,         `streamed output_tokens=${row.output_tokens}`);
   record('openai streaming: SSE captured + tokens parsed', 'PASS', `in=${row.input_tokens} out=${row.output_tokens}`);
+}
+
+async function testKimiNonStreaming() {
+  if (!process.env.MOONSHOT_API_KEY) {
+    record('kimi /v1/chat/completions non-streaming', 'SKIP', 'MOONSHOT_API_KEY unset');
+    return;
+  }
+  const before = db.prepare(`SELECT COUNT(*) c FROM requests`).get().c;
+  const r = await fetch(`${BASE}/kimi/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type':  'application/json',
+      'Authorization': `Bearer ${process.env.MOONSHOT_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: 'kimi-k2.6',
+      max_tokens: 32,
+      messages: [{ role: 'user', content: 'Reply with exactly the word: pong' }],
+    }),
+  });
+  if (!r.ok) throw new Error(`kimi non-stream status=${r.status} body=${await r.text()}`);
+  const j = await r.json();
+  assert(j.choices && j.choices[0] && j.choices[0].message, 'kimi response missing choices[0].message');
+
+  const after = db.prepare(`SELECT COUNT(*) c FROM requests`).get().c;
+  assert(after === before + 1, `expected 1 new row, got ${after - before}`);
+  const row = latestRow();
+  assert(row.provider === 'kimi',       `provider=${row.provider}`);
+  assert(row.interface === 'openai',    `interface=${row.interface}`);
+  assert(row.endpoint === '/kimi/v1/chat/completions', `endpoint=${row.endpoint}`);
+  assert(row.status_code === 200,       `status_code=${row.status_code}`);
+  assert(row.input_tokens > 0,          `input_tokens=${row.input_tokens}`);
+  assert(row.output_tokens > 0,         `output_tokens=${row.output_tokens}`);
+  const headers = JSON.parse(row.headers);
+  assert(headers['authorization'] === '[REDACTED]', 'authorization not redacted');
+  record('kimi non-streaming: 200 + row captured + openai-shape tokens mapped', 'PASS', `in=${row.input_tokens} out=${row.output_tokens}`);
+}
+
+async function testKimiStreaming() {
+  if (!process.env.MOONSHOT_API_KEY) {
+    record('kimi /v1/chat/completions streaming', 'SKIP', 'MOONSHOT_API_KEY unset');
+    return;
+  }
+  const r = await fetch(`${BASE}/kimi/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type':  'application/json',
+      'Authorization': `Bearer ${process.env.MOONSHOT_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: 'kimi-k2.6',
+      max_tokens: 32,
+      stream: true,
+      stream_options: { include_usage: true },
+      messages: [{ role: 'user', content: 'Reply with exactly the word: stream' }],
+    }),
+  });
+  assert(r.ok, `kimi stream status=${r.status}`);
+  const text = await r.text();
+  assert(text.includes('data:'), 'stream did not contain SSE data');
+  assert(text.includes('chat.completion.chunk') || text.includes('"delta"'), 'stream missing chunk markers');
+
+  await new Promise(r => setTimeout(r, 100));
+  const row = latestRow();
+  assert(row.provider === 'kimi',       `provider=${row.provider}`);
+  assert(row.input_tokens > 0,          `streamed input_tokens=${row.input_tokens}`);
+  assert(row.output_tokens > 0,         `streamed output_tokens=${row.output_tokens}`);
+  record('kimi streaming: SSE captured + tokens parsed (include_usage)', 'PASS', `in=${row.input_tokens} out=${row.output_tokens}`);
 }
 
 async function testOpenrouterGeminiNonStreaming() {
@@ -844,6 +916,8 @@ async function main() {
     ['deepseek',   testDeepseekStreaming],
     ['openai',     testOpenaiNonStreaming],
     ['openai',     testOpenaiStreaming],
+    ['kimi',       testKimiNonStreaming],
+    ['kimi',       testKimiStreaming],
     ['openrouter', testOpenrouterGeminiNonStreaming],
     ['openrouter', testOpenrouterGeminiStreaming],
     ['dashboard',  testDashboard],

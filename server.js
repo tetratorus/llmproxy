@@ -118,6 +118,26 @@ const PROVIDERS = {
     canonical_path: '/v1/chat/completions',
     models: ['grok-4', 'grok-4-mini', 'grok-3', 'grok-2'],
   },
+  // Moonshot AI / Kimi — OpenAI-compatible. Global endpoint api.moonshot.ai
+  // (the .cn host is the China-only endpoint and uses different keys).
+  kimi: {
+    interface: 'openai',
+    upstreamBase: 'https://api.moonshot.ai',
+    defaultPathPrefix: '/v1',
+    aliases: ['moonshot'],
+    canonical_path: '/v1/chat/completions',
+    models: [
+      'kimi-k2.6',
+      'kimi-k2.5',
+      'moonshot-v1-auto',
+      'moonshot-v1-8k',
+      'moonshot-v1-32k',
+      'moonshot-v1-128k',
+      'moonshot-v1-8k-vision-preview',
+      'moonshot-v1-32k-vision-preview',
+      'moonshot-v1-128k-vision-preview',
+    ],
+  },
   // OpenRouter aggregates many model providers behind one OpenAI-shaped endpoint.
   // We use this for Gemini (model id = "google/gemini-2.5-flash" etc.) per project decision
   // to not hit Google's native API directly.

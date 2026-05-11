@@ -11,6 +11,7 @@
     "test:deepseek": "node test.js deepseek",
     "test:openai": "node test.js openai",
     "test:openrouter": "node test.js openrouter",
+    "test:kimi": "node test.js kimi",
     "test:models": "node test.js models",
     "test:dashboard": "node test.js dashboard",
     "test:websocket": "node test.js websocket",
