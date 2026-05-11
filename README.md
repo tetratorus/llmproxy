@@ -87,6 +87,31 @@ export OPENAI_BASE_URL=http://localhost:8181/kimi/v1
 export OPENAI_BASE_URL=http://localhost:8181/openrouter/v1
 ```
 
+### LiteLLM SDK
+
+LiteLLM uses its own env-var names: `OPENAI_API_BASE`, `ANTHROPIC_API_BASE`, `DEEPSEEK_API_BASE`, `XAI_API_BASE` (not the SDK-standard `*_BASE_URL`). Set those and your existing litellm code routes through the proxy with no changes:
+
+```sh
+export OPENAI_API_BASE=http://localhost:8181/openai/v1
+export ANTHROPIC_API_BASE=http://localhost:8181/claude
+export DEEPSEEK_API_BASE=http://localhost:8181/deepseek
+export XAI_API_BASE=http://localhost:8181/xai/v1
+```
+
+For providers without a native litellm adapter (Kimi, OpenRouter, anything OpenAI-compat), pass `api_base` per call:
+
+```python
+litellm.completion(
+    model="moonshot-v1-8k",
+    api_base="http://localhost:8181/kimi/v1",
+    api_key=os.environ["MOONSHOT_API_KEY"],
+    custom_llm_provider="openai",
+    messages=[...],
+)
+```
+
+End-to-end test for all six providers: `python3 test_litellm.py` (proxy must be running).
+
 ### Optional: namespace by agent
 
 Prefix the path with an agent name and the proxy tags the request in the dashboard:
