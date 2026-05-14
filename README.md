@@ -22,9 +22,108 @@ Every request is persisted to SQLite (default: `requests.db`) with full body, fu
 
 ```sh
 npm install
-npm start                           # default: PORT=8182, DB=requests.db
+npm start                           # default: PORT=8181, DB=requests.db
 PORT=8888 LLMPROXY_DB=foo.db npm start
 ```
+
+## Point your tools at the proxy
+
+Each provider's SDK or CLI accepts a base-URL override. Set it to `http://localhost:8181/<provider>` and keep using your normal API key — the proxy forwards the request unchanged, records it, and returns the upstream response.
+
+The version prefix (`/v1`, `/v1beta`) is auto-applied when missing, so both `…/openai` and `…/openai/v1` work. Use whichever matches your SDK's convention.
+
+### Anthropic (Claude) — Claude Code, Anthropic SDK
+
+```sh
+export ANTHROPIC_BASE_URL=http://localhost:8181/claude
+```
+
+### OpenAI SDK
+
+```sh
+export OPENAI_BASE_URL=http://localhost:8181/openai/v1
+```
+
+In Python: `OpenAI(base_url="http://localhost:8181/openai/v1")`.
+
+### DeepSeek (OpenAI-shape)
+
+```sh
+export OPENAI_BASE_URL=http://localhost:8181/deepseek/v1
+```
+
+### Codex CLI (ChatGPT-authed, not API-key)
+
+In `~/.codex/config.toml`:
+
+```toml
+[model_provider]
+base_url = "http://localhost:8181/codex"
+```
+
+### Gemini (Google)
+
+No standard env var — pass it via SDK options:
+
+```js
+new GoogleGenAI({ httpOptions: { baseUrl: "http://localhost:8181/gemini" } })
+```
+
+### xAI (Grok)
+
+```sh
+export OPENAI_BASE_URL=http://localhost:8181/xai/v1
+```
+
+### Kimi (Moonshot)
+
+```sh
+export OPENAI_BASE_URL=http://localhost:8181/kimi/v1
+```
+
+### OpenRouter
+
+```sh
+export OPENAI_BASE_URL=http://localhost:8181/openrouter/v1
+```
+
+### LiteLLM SDK
+
+LiteLLM uses its own env-var names: `OPENAI_API_BASE`, `ANTHROPIC_API_BASE`, `DEEPSEEK_API_BASE`, `XAI_API_BASE` (not the SDK-standard `*_BASE_URL`). Set those and your existing litellm code routes through the proxy with no changes:
+
+```sh
+export OPENAI_API_BASE=http://localhost:8181/openai/v1
+export ANTHROPIC_API_BASE=http://localhost:8181/claude
+export DEEPSEEK_API_BASE=http://localhost:8181/deepseek
+export XAI_API_BASE=http://localhost:8181/xai/v1
+```
+
+For providers without a native litellm adapter (Kimi, OpenRouter, anything OpenAI-compat), pass `api_base` per call:
+
+```python
+litellm.completion(
+    model="moonshot-v1-8k",
+    api_base="http://localhost:8181/kimi/v1",
+    api_key=os.environ["MOONSHOT_API_KEY"],
+    custom_llm_provider="openai",
+    messages=[...],
+)
+```
+
+End-to-end test for all six providers: `python3 test_litellm.py` (proxy must be running).
+
+### Optional: namespace by agent
+
+Prefix the path with an agent name and the proxy tags the request in the dashboard:
+
+```sh
+export ANTHROPIC_BASE_URL=http://localhost:8181/cline/claude
+export OPENAI_BASE_URL=http://localhost:8181/cursor/openai/v1
+```
+
+`/<agent>/<provider>/<path>` routes the same way as `/<provider>/<path>` — the agent segment is metadata only.
+
+Open `http://localhost:8181/` to see the captured traffic.
 
 ## Test
 
