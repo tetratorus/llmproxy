@@ -18,7 +18,6 @@ const path = require('path');
 const http = require('http');
 const https = require('https');
 const toml = require('smol-toml');
-const compliance = require('./compliance');
 
 const PORT = parseInt(process.env.PORT || '8181', 10);
 const DB_PATH = process.env.LLMPROXY_DB || 'requests.db';
@@ -541,7 +540,6 @@ async function evaluatePolicies(rules, text) {
 
 // ── App setup ────────────────────────────────────────────────────────────
 const app = express();
-compliance.init();
 
 // zstd / zst content-encoding passthrough. Node's express.json/text/raw
 // don't know how to decompress zstd, so without this middleware those
@@ -904,7 +902,6 @@ async function handleProxy(providerEntry, req, res, agent = null) {
       requestId,
     );
     console.log(`✅ ${providerKey} ${requestId} stream ${Date.now() - startTime}ms tokens=${parsed.usage.input_tokens}/${parsed.usage.output_tokens}`);
-    if (agent) compliance.check(agent, req.body);
     return;
   }
 
@@ -937,7 +934,6 @@ async function handleProxy(providerEntry, req, res, agent = null) {
      .send(responseText);
 
   console.log(`✅ ${providerKey} ${requestId} ${elapsed}ms tokens=${tokens.input_tokens}/${tokens.output_tokens} status=${upstreamResponse.status}`);
-  if (agent) compliance.check(agent, req.body);
 }
 
 // ── Routes ───────────────────────────────────────────────────────────────
