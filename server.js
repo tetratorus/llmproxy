@@ -270,27 +270,6 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_ws_frames_payload ON websocket_frames(payload);
 `);
 
-// FTS5 over body+response for the dashboard search (kept compatible with cproxy).
-try {
-  db.exec(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS requests_fts USING fts5(
-      body, response, content='requests', content_rowid='rowid'
-    );
-    CREATE TRIGGER IF NOT EXISTS requests_ai AFTER INSERT ON requests BEGIN
-      INSERT INTO requests_fts(rowid, body, response) VALUES (new.rowid, new.body, new.response);
-    END;
-    CREATE TRIGGER IF NOT EXISTS requests_au AFTER UPDATE ON requests BEGIN
-      INSERT INTO requests_fts(requests_fts, rowid, body, response) VALUES('delete', old.rowid, old.body, old.response);
-      INSERT INTO requests_fts(rowid, body, response) VALUES (new.rowid, new.body, new.response);
-    END;
-    CREATE TRIGGER IF NOT EXISTS requests_ad AFTER DELETE ON requests BEGIN
-      INSERT INTO requests_fts(requests_fts, rowid, body, response) VALUES('delete', old.rowid, old.body, old.response);
-    END;
-  `);
-} catch (e) {
-  console.warn('FTS5 setup skipped:', e.message);
-}
-
 // Try to parse a stored response as JSON; if that fails (SSE stream, malformed
 // upstream payload, OpenRouter's leading ": OPENROUTER PROCESSING" comment line,
 // etc.) return the raw string. Used by /api/requests so the dashboard never
@@ -643,7 +622,8 @@ function extractTokens(interfaceName, parsedBody) {
       cache_read_input_tokens: u.cache_read_input_tokens || 0,
     };
   }
-  if (interfaceName === 'openai') {
+  if (interfaceName === 'openai' || interfaceName === 'gemini') {
+    // Gemini responses use OpenAI-compatible shape even though interface is 'gemini'
     const cached = (u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens) || 0;
     return {
       input_tokens: u.prompt_tokens || 0,
@@ -681,7 +661,8 @@ function parseSSE(interfaceName, sseText) {
         usage.input_tokens = data.usage.input_tokens || usage.input_tokens;
         usage.output_tokens = data.usage.output_tokens || usage.output_tokens;
       }
-    } else if (interfaceName === 'openai') {
+    } else if (interfaceName === 'openai' || interfaceName === 'gemini') {
+      // Gemini streaming responses use OpenAI-compatible chunk shape
       // chat.completion.chunk events. Final chunk carries usage when stream_options.include_usage=true.
       if (data.model) model = data.model;
       if (data.usage) {
