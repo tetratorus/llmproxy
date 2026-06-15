@@ -270,6 +270,13 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_ws_frames_payload ON websocket_frames(payload);
 `);
 
+// Message store. A request body's messages array is the same growing conversation
+// re-sent every turn, so storing it inline duplicates it N times over. Instead each
+// message is content-hashed into chunks (stored once) and the body keeps a same-length
+// array of {$h} pointers — so json_array_length(body.$.messages) and conversation
+// navigation still work unchanged.
+db.exec(`CREATE TABLE IF NOT EXISTS chunks (h TEXT PRIMARY KEY, c TEXT)`);
+
 // Try to parse a stored response as JSON; if that fails (SSE stream, malformed
 // upstream payload, OpenRouter's leading ": OPENROUTER PROCESSING" comment line,
 // etc.) return the raw string. Used by /api/requests so the dashboard never
@@ -729,6 +736,29 @@ function safeJson(value) {
   return JSON.stringify(value);
 }
 
+// Swap each message in a body for a content-hash pointer, stashing the content in
+// chunks (deduped across every turn and conversation). Returns a new body; req.body
+// is left intact for forwarding upstream. Non-object/Buffer/messageless bodies pass through.
+const insChunk = db.prepare(`INSERT OR IGNORE INTO chunks (h, c) VALUES (?, ?)`);
+function stash(body) {
+  if (!body || typeof body !== 'object' || Buffer.isBuffer(body) || !Array.isArray(body.messages)) return body;
+  const messages = body.messages.map(m => {
+    const c = JSON.stringify(m);
+    const h = crypto.createHash('sha1').update(c).digest('hex');
+    insChunk.run(h, c);
+    return { $h: h };
+  });
+  return { ...body, messages };
+}
+
+// Reverse of stash: replace {$h} pointers with their stored content.
+const getChunk = db.prepare(`SELECT c FROM chunks WHERE h = ?`);
+function unstash(body) {
+  if (body && Array.isArray(body.messages))
+    body.messages = body.messages.map(m => (m && m.$h) ? JSON.parse(getChunk.get(m.$h).c) : m);
+  return body;
+}
+
 // Headers we forward back from upstream → client (rate-limit etc, by interface).
 function passthroughResponseHeaders(interfaceName) {
   if (interfaceName === 'anthropic') {
@@ -779,7 +809,7 @@ async function handleProxy(providerEntry, req, res, agent = null) {
     req.method,
     req.path,
     JSON.stringify(sanitizeHeaders(req.headers)),
-    safeJson(req.body),
+    safeJson(stash(req.body)),
     originalModel,
     originalModel,
     req.headers['user-agent'] || null,
@@ -961,14 +991,20 @@ app.get('/api/requests', (req, res) => {
     let like = null;
     if (search) {
       like = `%${search}%`;
+      // Message text lives in chunks now, not inline in body. Find the chunks whose
+      // content matches (one scan of the dedup'd chunk table), then a row matches if
+      // its body references any of them. Body still carries system prompt + tool defs,
+      // so the plain `body LIKE` below still covers those.
+      const matchHashes = JSON.stringify(db.prepare(`SELECT h FROM chunks WHERE c LIKE ?`).all(like).map(r => r.h));
       whereParts.push(`(endpoint LIKE ? OR provider LIKE ? OR model LIKE ?
           OR body LIKE ? OR response LIKE ?
+          OR EXISTS (SELECT 1 FROM json_each(?) WHERE instr(requests.body, json_each.value))
           OR EXISTS (
             SELECT 1 FROM websocket_frames
             WHERE websocket_frames.request_id = requests.id
               AND websocket_frames.payload LIKE ?
           ))`);
-      whereParams.push(like, like, like, like, like, like);
+      whereParams.push(like, like, like, like, like, matchHashes, like);
     }
     if (agent) {
       whereParts.push(`requests.agent = ?`);
@@ -1010,7 +1046,7 @@ app.get('/api/requests', (req, res) => {
       try {
         let bodyObj = null;
         if (r.body) {
-          bodyObj = JSON.parse(r.body);
+          bodyObj = unstash(JSON.parse(r.body));
           // Trim system prompt in list view (first 200 chars of first message content)
           if (bodyObj && bodyObj.messages && bodyObj.messages.length > 0) {
             const first = bodyObj.messages[0].content;
@@ -1063,7 +1099,7 @@ app.get('/api/requests/:id', (req, res) => {
     if (!r) return res.status(404).json({ error: 'Request not found' });
     try {
       r.headers  = r.headers ? JSON.parse(r.headers) : null;
-      r.body     = r.body ? JSON.parse(r.body) : null;
+      r.body     = r.body ? unstash(JSON.parse(r.body)) : null;
       r.response = parseStoredResponse(r.response);
       r.websocket_frame_count = r.websocket_frame_count || 0;
     } catch (_) {}
