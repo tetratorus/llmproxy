@@ -778,7 +778,7 @@ function passthroughResponseHeaders(interfaceName) {
 // Bot-username validator: Telegram allows letters/digits/underscores, 5-32 chars,
 // must end in 'bot'. We only enforce shape here; collisions are impossible because
 // Telegram itself enforces global uniqueness.
-const AGENT_RE = /^[A-Za-z0-9_]{5,32}$/;
+const AGENT_RE = /^[A-Za-z0-9_-]{3,40}$/;
 
 // ── Generic proxy handler ────────────────────────────────────────────────
 async function handleProxy(providerEntry, req, res, agent = null) {
