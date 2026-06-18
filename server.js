@@ -69,6 +69,13 @@ const PROVIDERS = {
       'deepseek-reasoner',
     ],
   },
+  zhipu: {
+    interface: 'openai',
+    upstreamBase: 'https://open.bigmodel.cn',
+    defaultPathPrefix: '/api/paas/v4',
+    canonical_path: '/chat/completions',
+    models: ['glm-5.2'],
+  },
   openai: {
     interface: 'openai',
     upstreamBase: 'https://api.openai.com',

@@ -385,16 +385,74 @@
     .stats-bar {
       display: flex;
       gap: 20px;
-      padding: 12px;
+      padding: 12px 16px;
       background: var(--bg-primary);
       border-radius: 6px;
       border: 1px solid var(--border);
       margin-bottom: 20px;
       font-size: 14px;
+      flex-wrap: wrap;
+      align-items: center;
     }
 
     .stats-bar strong {
       color: var(--accent);
+      font-size: 16px;
+    }
+
+    .stats-bar .stat-item {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 4px 12px;
+      border-right: 1px solid var(--border);
+      min-width: 80px;
+    }
+
+    .stats-bar .stat-item:last-child {
+      border-right: none;
+    }
+
+    .stats-bar .stat-label {
+      font-size: 11px;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .stats-bar .stat-value {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--accent);
+    }
+
+    .stats-bar .stat-value.good { color: #2ea043; }
+    .stats-bar .stat-value.warn { color: #d29922; }
+    .stats-bar .stat-value.bad { color: #da3633; }
+
+    .agent-breakdown {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 8px;
+      margin-bottom: 20px;
+    }
+
+    .agent-card {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px 14px;
+      font-size: 13px;
+    }
+
+    .agent-card .agent-name {
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+
+    .agent-card .agent-stats {
+      color: var(--text-secondary);
+      font-size: 12px;
     }
 
     .conversation-nav {
@@ -500,6 +558,13 @@
         selectedRequest: null,
         currentSearch: '',
         currentAgent: '',
+        // Aggregate stats
+        successRate: 0,
+        totalInputTokens: 0,
+        totalOutputTokens: 0,
+        estimatedCost: 0,
+        avgLatency: 0,
+        agentBreakdownHtml: '',
 
         // Populate agent filter from server
         async loadAgents() {
@@ -511,6 +576,68 @@
           } catch (_) {
             this.availableAgents = [];
           }
+        },
+
+        // Format token counts
+        fmtTokens(n) {
+          if (!n || n === 0) return '0';
+          if (n >= 1e9) return (n/1e9).toFixed(1) + 'B';
+          if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
+          if (n >= 1e3) return (n/1e3).toFixed(1) + 'K';
+          return n.toLocaleString();
+        },
+
+        // Load aggregate stats from server-side API
+        async loadStats() {
+          try {
+            // Fetch overall stats from the new aggregate endpoint
+            const resp = await fetch('/llm/api/stats');
+            const stats = await resp.json();
+
+            if (!stats || !stats.total) return;
+
+            this.successRate = stats.success_rate || 100;
+            this.totalInputTokens = stats.input_tokens || 0;
+            this.totalOutputTokens = stats.output_tokens || 0;
+            this.avgLatency = stats.avg_latency || 0;
+
+            // DeepSeek pricing (per 1M tokens): $0.55 input, $2.19 output, $0.14 cache hit
+            const costIn = ((stats.input_tokens || 0) / 1e6) * 0.55;
+            const costOut = ((stats.output_tokens || 0) / 1e6) * 2.19;
+            const costCache = ((stats.cache_hit_tokens || 0) / 1e6) * 0.14;
+            this.estimatedCost = costIn + costOut - costCache;
+
+            // Fetch agent breakdown
+            try {
+              const agentResp = await fetch('/llm/api/stats/agents');
+              const agents = await agentResp.json();
+
+              if (agents && agents.length > 0) {
+                this.agentBreakdownHtml = '<div class="agent-breakdown">' +
+                  agents.slice(0, 8).map(a => `
+                    <div class="agent-card">
+                      <div class="agent-name">${this.escapeHtml(a.agent)}</div>
+                      <div class="agent-stats">
+                        ${a.requests} reqs · ${this.fmtTokens(a.input_tokens)} in / ${this.fmtTokens(a.output_tokens)} out
+                      </div>
+                    </div>
+                  `).join('') +
+                  '</div>';
+              } else {
+                this.agentBreakdownHtml = '';
+              }
+            } catch (_) {
+              this.agentBreakdownHtml = '';
+            }
+          } catch (e) {
+            // Stats load failed - silently ignore
+          }
+        },
+
+        escapeHtml(text) {
+          const div = document.createElement('div');
+          div.textContent = text || '';
+          return div.innerHTML;
         },
 
         // Initialize
@@ -546,6 +673,7 @@
           const agent = urlParams.get('agent') || '';
           this.currentAgent = agent;
           await this.loadAgents();
+          this.loadStats();
 
           if (view === 'detail' && id) {
             const expanded = urlParams.get('expanded') ? urlParams.get('expanded').split(',') : [];
@@ -589,6 +717,8 @@
             this.totalRequests = data.total;
             this.currentSearch = searchQuery;
             this.currentView = 'list';
+            // Refresh aggregate stats after each page load
+            this.loadStats();
 
             // Update URL and history
             if (!skipHistory) {
@@ -788,8 +918,32 @@
           ${app.currentSearch ? `<button id="clearBtn" style="padding: 8px 16px; background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 4px; cursor: pointer;">Clear</button>` : ''}
         </div>
         <div class="stats-bar">
-          <span><strong>${app.totalRequests}</strong> ${app.currentSearch ? `result${app.totalRequests !== 1 ? 's' : ''} for "${app.currentSearch}"` : 'total requests'}</span>
+          <div class="stat-item">
+            <span class="stat-label">Requests</span>
+            <span class="stat-value">${app.totalRequests.toLocaleString()}</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">Success</span>
+            <span class="stat-value ${app.successRate >= 95 ? 'good' : app.successRate >= 80 ? 'warn' : 'bad'}">${app.successRate.toFixed(1)}%</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">Tokens In</span>
+            <span class="stat-value">${app.fmtTokens(app.totalInputTokens)}</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">Tokens Out</span>
+            <span class="stat-value">${app.fmtTokens(app.totalOutputTokens)}</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">Est. Cost</span>
+            <span class="stat-value">$${app.estimatedCost.toFixed(2)}</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">Avg Latency</span>
+            <span class="stat-value">${app.avgLatency}ms</span>
+          </div>
         </div>
+        ${app.agentBreakdownHtml || ''}
         <div class="request-list">
           ${conversationHtml}
         </div>
