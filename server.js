@@ -18,6 +18,7 @@ const path = require('path');
 const http = require('http');
 const https = require('https');
 const toml = require('smol-toml');
+const { generateStatsPage } = require('./stats-handler');
 
 const PORT = parseInt(process.env.PORT || '8181', 10);
 const DB_PATH = process.env.LLMPROXY_DB || 'requests.db';
@@ -134,6 +135,7 @@ const PROVIDERS = {
     aliases: ['moonshot'],
     canonical_path: '/v1/chat/completions',
     models: [
+      'kimi-k3',
       'kimi-k2.6',
       'kimi-k2.5',
       'moonshot-v1-auto',
@@ -946,6 +948,14 @@ async function handleProxy(providerEntry, req, res, agent = null) {
 // ── Routes ───────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ status: 'healthy', timestamp: new Date(), port: PORT, db: DB_PATH }));
 
+// Stats dashboard
+app.get('/stats', (_req, res) => {
+  try {
+    const html = generateStatsPage(DB_PATH);
+    res.type('html').send(html);
+  } catch (e) { res.status(500).send('Stats error: ' + e.message); }
+});
+
 app.get('/models', (_req, res) => {
   const data = [];
   for (const [key, p] of Object.entries(PROVIDERS)) {
@@ -1252,6 +1262,13 @@ app.use((req, res, next) => {
     }
   }
   if (!entry) return next();
+
+  // Support header-based agent attribution (X-Agent-ID) for test runners
+  // and CI tooling. Overrides any path-derived agent name.
+  const headerAgent = req.headers['x-agent-id'];
+  if (headerAgent && AGENT_RE.test(String(headerAgent))) {
+    agent = String(headerAgent);
+  }
   return handleProxy(entry, req, res, agent);
 });
 
