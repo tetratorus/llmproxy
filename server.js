@@ -628,6 +628,14 @@ function extractTokens(interfaceName, parsedBody) {
   if (!parsedBody || typeof parsedBody !== 'object') return null;
   const u = parsedBody.usage;
   if (!u) return null;
+  if (parsedBody.object === 'response' || interfaceName === 'codex') {
+    return {
+      input_tokens: u.input_tokens || 0,
+      output_tokens: u.output_tokens || 0,
+      cache_creation_input_tokens: u.input_tokens_details?.cache_write_tokens || 0,
+      cache_read_input_tokens: u.input_tokens_details?.cached_tokens || 0,
+    };
+  }
   if (interfaceName === 'anthropic') {
     return {
       input_tokens: u.input_tokens || 0,
