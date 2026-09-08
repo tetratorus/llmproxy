@@ -670,6 +670,12 @@ function parseSSE(interfaceName, sseText) {
     let data;
     try { data = JSON.parse(dataStr); } catch (_) { continue; }
 
+    if (data?.response && typeof data.type === 'string' && data.type.startsWith('response.')) {
+      model = data.response.model || model;
+      const tokens = extractTokens('codex', data.response);
+      if (tokens) Object.assign(usage, tokens);
+      continue;
+    }
     if (interfaceName === 'anthropic') {
       if (data.type === 'message_start' && data.message) {
         model = data.message.model || model;

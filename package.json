@@ -16,7 +16,8 @@
     "test:dashboard": "node test.js dashboard",
     "test:websocket": "node test.js websocket",
     "test:policy": "node test.js policy",
-    "test:agent": "node test.js agent"
+    "test:agent": "node test.js agent",
+    "test:tokens": "node --test test-tokens.js"
   },
   "keywords": [
     "llm",
